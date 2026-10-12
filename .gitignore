@@ -1,0 +1,21 @@
+/target/
+/raw/
+/exports/
+/.greign/
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+.idea/
+.vscode/
+*.swp
+*.tmp
+fixtures/private/
+fixtures/downloads/
+fixtures/jpg/
+artifacts/
+.DS_Store
+/dist/
+# The separate darktable checkout is reproduced from its pinned patch bundle.
+/darktable-mods/darktable/
+__pycache__/

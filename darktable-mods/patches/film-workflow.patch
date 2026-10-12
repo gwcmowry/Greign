@@ -1,0 +1,2093 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 40edc63..10b6767 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -48,6 +48,9 @@ FILE(GLOB SOURCE_FILES
+   "common/eaw.c"
+   "common/exif.cc"
+   "common/file_location.c"
++  "common/film_analysis.c"
++  "common/film_roll_analysis.c"
++  "common/film_roll_workflow.c"
+   "common/film.c"
+   "common/gaussian.c"
+   "common/gimp.c"
+diff --git a/src/cli/CMakeLists.txt b/src/cli/CMakeLists.txt
+index edae786..eb70656 100644
+--- a/src/cli/CMakeLists.txt
++++ b/src/cli/CMakeLists.txt
+@@ -1,8 +1,10 @@
+ include_directories(${DARKTABLE_BINDIR})
+ add_executable(darktable-cli main.c)
++add_executable(darktable-film-roll-cli film_roll.c)
+ 
+ set_target_properties(darktable-cli PROPERTIES LINKER_LANGUAGE C)
+ target_link_libraries(darktable-cli lib_darktable whereami)
++target_link_libraries(darktable-film-roll-cli lib_darktable whereami)
+ 
+ if (WIN32)
+   _detach_debuginfo (darktable-cli bin)
+@@ -11,6 +13,10 @@ else()
+                           PROPERTIES
+                           INSTALL_RPATH ${RPATH_ORIGIN}/${REL_BIN_TO_LIBDIR}
+                           RUNTIME_OUTPUT_DIRECTORY ${DARKTABLE_BINDIR})
++    set_target_properties(darktable-film-roll-cli
++                          PROPERTIES
++                          INSTALL_RPATH ${RPATH_ORIGIN}/${REL_BIN_TO_LIBDIR}
++                          RUNTIME_OUTPUT_DIRECTORY ${DARKTABLE_BINDIR})
+ endif(WIN32)
+ 
+ install(TARGETS darktable-cli DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT DTApplication)
+diff --git a/src/iop/negadoctor.c b/src/iop/negadoctor.c
+index 338934c..2c6a344 100644
+--- a/src/iop/negadoctor.c
++++ b/src/iop/negadoctor.c
+@@ -18,6 +18,7 @@
+ 
+ #include "bauhaus/bauhaus.h"
+ #include "common/darktable.h"
++#include "common/film_analysis.h"
+ #include "common/opencl.h"
+ #include "control/control.h"
+ #include "develop/develop.h"
+@@ -90,6 +91,9 @@ typedef struct dt_iop_negadoctor_params_t
+                                                $MIN: 0.5 $MAX: 2.0 $DEFAULT: 0.9245 $DESCRIPTION: "print exposure adjustment" */
+ } dt_iop_negadoctor_params_t;
+ 
++_Static_assert(sizeof(dt_iop_negadoctor_params_t) == 76,
++               "film roll history bridge requires Negadoctor v2 wire layout");
++
+ 
+ typedef struct dt_iop_negadoctor_data_t
+ {
+@@ -101,6 +105,7 @@ typedef struct dt_iop_negadoctor_data_t
+   float soft_clip;                        // highlights roll-off
+   float soft_clip_comp;                   // 1 - softclip, complement to 1
+   float exposure;                         // extra exposure
++  dt_iop_negadoctor_filmstock_t film_stock;
+ } dt_iop_negadoctor_data_t;
+ 
+ 
+@@ -117,6 +122,11 @@ typedef struct dt_iop_negadoctor_gui_data_t
+   GtkWidget *Dmin_picker, *Dmin_sampler;
+   GtkWidget *WB_high_picker, *WB_high_sampler;
+   GtkWidget *WB_low_picker, *WB_low_sampler;
++  GtkWidget *auto_analyze, *auto_status;
++  dt_film_analysis_result_t analysis;
++  dt_imgid_t analysis_imgid;
++  gboolean analysis_valid;
++  GMutex analysis_lock;
+ } dt_iop_negadoctor_gui_data_t;
+ 
+ 
+@@ -263,6 +273,51 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
+   // copy
+   d->exposure = p->exposure;
+   d->gamma = p->gamma;
++  d->film_stock = p->film_stock;
++}
++
++static gboolean _auto_analyze_enable_idle(gpointer user_data)
++{
++  GtkWidget *const button = GTK_WIDGET(user_data);
++  gtk_widget_set_sensitive(button, TRUE);
++  gtk_widget_set_tooltip_text(
++    button,
++    _("analyze the current preview before inversion and set the technical film controls\n"
++      "as one reversible history item; virtual paper controls are left unchanged"));
++  g_object_unref(button);
++  return G_SOURCE_REMOVE;
++}
++
++static void _update_film_analysis(dt_iop_module_t *const self,
++                                  dt_dev_pixelpipe_iop_t *const piece,
++                                  const float *const input,
++                                  const dt_iop_roi_t *const roi_in)
++{
++  if(!self->gui_data || !dt_pipe_is_preview(piece->pipe) || piece->colors != 4) return;
++
++  const dt_iop_negadoctor_data_t *const d = piece->data;
++  dt_iop_negadoctor_gui_data_t *const g = self->gui_data;
++  const dt_film_stock_t stock = d->film_stock == DT_FILMSTOCK_NB
++                                  ? DT_FILM_STOCK_MONOCHROME
++                                  : DT_FILM_STOCK_COLOR;
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(stock);
++  dt_film_analysis_result_t analysis;
++  if(dt_film_analyze_rgba_f32(input, roi_in->width, roi_in->height,
++                              (size_t)roi_in->width * 4, &config, &analysis) != 0)
++    return;
++
++  g_mutex_lock(&g->analysis_lock);
++  const gboolean was_invalid = !g->analysis_valid;
++  g->analysis = analysis;
++  g->analysis_imgid = piece->pipe->image.id;
++  g->analysis_valid = TRUE;
++  g_mutex_unlock(&g->analysis_lock);
++
++  if(was_invalid)
++  {
++    g_object_ref(g->auto_analyze);
++    gdk_threads_add_idle(_auto_analyze_enable_idle, g->auto_analyze);
++  }
+ }
+ 
+ static inline void _process_pixel(const dt_aligned_pixel_t pix_in,
+@@ -331,6 +386,8 @@ void process(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
+   const float *const restrict in = (float *)ivoid;
+   float *const restrict out = (float *)ovoid;
+ 
++  _update_film_analysis(self, piece, in, roi_in);
++
+   dt_aligned_pixel_t gamma;
+   dt_aligned_pixel_t black;
+   dt_aligned_pixel_t exposure;
+@@ -370,9 +427,22 @@ int process_cl(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
+   const int width = roi_in->width;
+   const int height = roi_in->height;
+ 
+-  return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_negadoctor, width, height,
++  const int err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_negadoctor, width, height,
+     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(d->Dmin), CLARG(d->wb_high),
+     CLARG(d->offset), CLARG(d->exposure), CLARG(d->black), CLARG(d->gamma), CLARG(d->soft_clip), CLARG(d->soft_clip_comp));
++
++  if(err == CL_SUCCESS && self->gui_data && dt_pipe_is_preview(piece->pipe))
++  {
++    float *const host_in = dt_alloc_align_float((size_t)width * height * 4);
++    if(host_in)
++    {
++      if(dt_opencl_copy_image_to_host(devid, host_in, dev_in, width, height,
++                                      4 * sizeof(float)) == CL_SUCCESS)
++        _update_film_analysis(self, piece, host_in, roi_in);
++      dt_free_align(host_in);
++    }
++  }
++  return err;
+ }
+ #endif
+ 
+@@ -828,6 +898,86 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker,
+     dt_print(DT_DEBUG_ALWAYS, "[negadoctor] unknown color picker");
+ }
+ 
++static void _auto_analyze_callback(GtkButton *button, dt_iop_module_t *self)
++{
++  DT_GUARD_GUI_UPDATE();
++  dt_iop_negadoctor_gui_data_t *const g = self->gui_data;
++  dt_iop_negadoctor_params_t *const p = self->params;
++  dt_film_analysis_result_t analysis;
++
++  g_mutex_lock(&g->analysis_lock);
++  const gboolean valid = g->analysis_valid
++                         && g->analysis_imgid == self->dev->image_storage.id;
++  analysis = g->analysis;
++  g_mutex_unlock(&g->analysis_lock);
++  if(!valid)
++  {
++    gtk_label_set_text(GTK_LABEL(g->auto_status), _("waiting for this image's preview"));
++    return;
++  }
++
++  if(analysis.warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE)
++  {
++    gtk_label_set_text(GTK_LABEL(g->auto_status),
++                       _("not applied: film base reaches the scanner ceiling"));
++    dt_control_log(_("film analysis was not applied because the film base is clipped"));
++    return;
++  }
++
++  if(p->film_stock == DT_FILMSTOCK_COLOR)
++  {
++    for(size_t channel = 0; channel < 3; channel++)
++      p->Dmin[channel] = CLAMP(analysis.film_base[channel], 0.00001f, 1.5f);
++  }
++  else
++  {
++    const float neutral_base = (analysis.film_base[0]
++                                + analysis.film_base[1]
++                                + analysis.film_base[2]) / 3.0f;
++    for(size_t channel = 0; channel < 3; channel++)
++      p->Dmin[channel] = CLAMP(neutral_base, 0.00001f, 1.5f);
++  }
++  p->Dmin[3] = 1.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    p->wb_high[channel] = CLAMP(analysis.negadoctor_wb_high[channel], 0.25f, 2.0f);
++    p->wb_low[channel] = 1.0f;
++  }
++  p->wb_high[3] = p->wb_low[3] = 1.0f;
++  p->D_max = CLAMP(analysis.negadoctor_dmax, 0.1f, 6.0f);
++  p->offset = CLAMP(analysis.negadoctor_offset, -1.0f, 1.0f);
++
++  DT_ENTER_GUI_UPDATE();
++  dt_bauhaus_slider_set(g->Dmin_R, p->Dmin[0]);
++  dt_bauhaus_slider_set(g->Dmin_G, p->Dmin[1]);
++  dt_bauhaus_slider_set(g->Dmin_B, p->Dmin[2]);
++  dt_bauhaus_slider_set(g->D_max, p->D_max);
++  dt_bauhaus_slider_set(g->offset, p->offset);
++  dt_bauhaus_slider_set(g->wb_high_R, p->wb_high[0]);
++  dt_bauhaus_slider_set(g->wb_high_G, p->wb_high[1]);
++  dt_bauhaus_slider_set(g->wb_high_B, p->wb_high[2]);
++  dt_bauhaus_slider_set(g->wb_low_R, p->wb_low[0]);
++  dt_bauhaus_slider_set(g->wb_low_G, p->wb_low[1]);
++  dt_bauhaus_slider_set(g->wb_low_B, p->wb_low[2]);
++  DT_LEAVE_GUI_UPDATE();
++
++  Dmin_picker_update(self);
++  WB_high_picker_update(self);
++  WB_low_picker_update(self);
++
++  gchar *const status = g_strdup_printf(
++    analysis.warnings & (DT_FILM_ANALYSIS_WARNING_NO_REBATE
++                         | DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE)
++      ? _("applied with %.0f%% confidence · film base inferred from frame")
++      : _("applied with %.0f%% confidence · film base measured from border"),
++    analysis.confidence * 100.0f);
++  gtk_label_set_text(GTK_LABEL(g->auto_status), status);
++  g_free(status);
++
++  dt_control_queue_redraw_widget(self->widget);
++  dt_dev_add_history_item(self->dev, self, TRUE);
++}
++
+ void gui_init(dt_iop_module_t *self)
+ {
+   dt_iop_negadoctor_gui_data_t *g = IOP_GUI_ALLOC(negadoctor);
+@@ -839,6 +989,26 @@ void gui_init(dt_iop_module_t *self)
+   // Page FILM PROPERTIES
+   GtkWidget *page1 = self->widget = dt_ui_notebook_page(g->notebook, N_("film properties"), NULL);
+ 
++  g->analysis_valid = FALSE;
++  g->analysis_imgid = -1;
++  g_mutex_init(&g->analysis_lock);
++  g->auto_analyze = gtk_button_new_with_label(_("analyze current frame"));
++  gtk_widget_set_sensitive(g->auto_analyze, FALSE);
++  gtk_widget_set_tooltip_text(
++    g->auto_analyze,
++    _("enable negadoctor and wait for the preview before running film analysis"));
++  dt_action_define_iop(self, NULL, N_("analyze current frame"),
++                       g->auto_analyze, &dt_action_def_button);
++  g_signal_connect(G_OBJECT(g->auto_analyze), "clicked",
++                   G_CALLBACK(_auto_analyze_callback), self);
++  g->auto_status = gtk_label_new(_("waiting for an enabled preview"));
++  gtk_label_set_xalign(GTK_LABEL(g->auto_status), 0.0f);
++  gtk_label_set_line_wrap(GTK_LABEL(g->auto_status), TRUE);
++  dt_gui_box_add(page1,
++                 dt_ui_section_label_new(C_("section", "automatic film analysis")),
++                 g->auto_analyze,
++                 g->auto_status);
++
+   // Dmin
+   g->Dmin_picker = gtk_color_button_new();
+   gtk_color_chooser_set_use_alpha(GTK_COLOR_CHOOSER(g->Dmin_picker), FALSE);
+@@ -1071,6 +1241,13 @@ void gui_reset(dt_iop_module_t *self)
+ {
+   dt_iop_color_picker_reset(self, TRUE);
+ }
++
++void gui_cleanup(dt_iop_module_t *self)
++{
++  dt_iop_negadoctor_gui_data_t *const g = self->gui_data;
++  if(g) g_mutex_clear(&g->analysis_lock);
++  dt_iop_default_cleanup(self);
++}
+ // clang-format off
+ // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+ // vim: shiftwidth=2 expandtab tabstop=2 cindent
+diff --git a/src/libs/CMakeLists.txt b/src/libs/CMakeLists.txt
+index 6c267ed..4b3b894 100644
+--- a/src/libs/CMakeLists.txt
++++ b/src/libs/CMakeLists.txt
+@@ -6,7 +6,7 @@ add_definitions(-include common/module_api.h)
+ add_definitions(-include libs/lib_api.h)
+ 
+ # The modules
+-set(MODULES import export copy_history styles tagging image select collect recentcollect filtering metadata metadata_view navigation histogram history snapshots modulegroups backgroundjobs colorpicker masks session duplicate ioporder)
++set(MODULES import export copy_history styles tagging image film_roll select collect recentcollect filtering metadata metadata_view navigation histogram history snapshots modulegroups backgroundjobs colorpicker masks session duplicate ioporder)
+ 
+ # The tools
+ set(MODULES ${MODULES} viewswitcher)
+@@ -30,6 +30,7 @@ add_library(export MODULE "export.c" "export_metadata.c")
+ add_library(copy_history MODULE "copy_history.c")
+ add_library(styles MODULE "styles.c")
+ add_library(image MODULE "image.c")
++add_library(film_roll MODULE "film_roll.c")
+ add_library(tagging MODULE "tagging.c")
+ add_library(select MODULE "select.c")
+ add_library(collect MODULE "collect.c")
+diff --git a/src/tests/unittests/CMakeLists.txt b/src/tests/unittests/CMakeLists.txt
+index 239c0a0..f1d4cdc 100644
+--- a/src/tests/unittests/CMakeLists.txt
++++ b/src/tests/unittests/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ add_subdirectory(iop)
++add_subdirectory(common)
+ 
+ if(USE_AI)
+   add_subdirectory(ai)
+diff --git a/src/cli/film_roll.c b/src/cli/film_roll.c
+new file mode 100644
+index 0000000..4c82a08
+--- /dev/null
++++ b/src/cli/film_roll.c
+@@ -0,0 +1,127 @@
++/* Development benchmark and headless integration harness for film-roll analysis. */
++
++#include "common/darktable.h"
++#include "common/database.h"
++#include "common/debug.h"
++#include "common/film.h"
++#include "common/film_roll_workflow.h"
++#include "common/image.h"
++
++#include <gtk/gtk.h>
++#include <stdio.h>
++#include <string.h>
++
++static void usage(const char *const program)
++{
++  fprintf(stderr, "usage: %s [--monochrome] RAW [RAW ...]\n", program);
++}
++
++int main(int argc, char **argv)
++{
++  if(!gtk_parse_args(&argc, &argv)) return 1;
++  dt_film_stock_t stock = DT_FILM_STOCK_COLOR;
++  int first_input = 1;
++  if(argc > 1 && !strcmp(argv[1], "--monochrome"))
++  {
++    stock = DT_FILM_STOCK_MONOCHROME;
++    first_input++;
++  }
++  if(argc <= first_input)
++  {
++    usage(argv[0]);
++    return 1;
++  }
++
++  char *core_argv[] = {
++    "darktable-film-roll-cli",
++    "--library", ":memory:",
++    "--conf", "write_sidecar_files=never",
++    "--disable-opencl",
++    NULL,
++  };
++  if(dt_init(6, core_argv, FALSE, FALSE, NULL)) return 1;
++
++  const size_t requested = (size_t)(argc - first_input);
++  dt_imgid_t *const ids = g_new0(dt_imgid_t, requested);
++  dt_film_analysis_result_t *const frames = g_new0(dt_film_analysis_result_t, requested);
++  size_t analyzed = 0;
++  const double started = dt_get_wtime();
++  for(int arg = first_input; arg < argc; arg++)
++  {
++    gchar *const directory = g_path_get_dirname(argv[arg]);
++    dt_film_t film;
++    const dt_filmid_t filmid = dt_film_new(&film, directory);
++    g_free(directory);
++    if(!dt_is_valid_filmid(filmid)) continue;
++    const dt_imgid_t imgid = dt_image_import(filmid, argv[arg], TRUE, FALSE);
++    if(!dt_is_valid_imgid(imgid)) continue;
++
++    const double frame_started = dt_get_wtime();
++    if(dt_film_analyze_image_proxy(imgid, stock, 1600, &frames[analyzed]) == 0)
++    {
++      ids[analyzed++] = imgid;
++      fprintf(stderr, "frame %zu analysis %.6f s\n", analyzed,
++              dt_get_wtime() - frame_started);
++    }
++  }
++  const double analysis_seconds = dt_get_wtime() - started;
++
++  dt_film_roll_analysis_result_t roll;
++  int status = analyzed == 0 ? 1 : dt_film_analyze_roll(frames, analyzed, NULL, NULL, &roll);
++  const double history_started = dt_get_wtime();
++  size_t written = 0;
++  if(status == 0)
++    for(size_t frame = 0; frame < analyzed; frame++)
++    {
++      const double frame_started = dt_get_wtime();
++      if(dt_film_write_roll_history(ids[frame], stock, &frames[frame], &roll) == 0)
++        written++;
++      fprintf(stderr, "frame %zu history %.6f s\n", frame + 1,
++              dt_get_wtime() - frame_started);
++    }
++  const double history_seconds = dt_get_wtime() - history_started;
++  const double total_seconds = dt_get_wtime() - started;
++
++  size_t verified = 0;
++  sqlite3_stmt *statement = NULL;
++  DT_DEBUG_SQLITE3_PREPARE_V2(
++    dt_database_get(darktable.db),
++    "SELECT COUNT(*) FROM main.history"
++    " WHERE imgid=?1 AND operation='negadoctor' AND enabled=1"
++    " AND length(op_params)=76",
++    -1, &statement, NULL);
++  for(size_t frame = 0; frame < analyzed; frame++)
++  {
++    DT_DEBUG_SQLITE3_BIND_INT(statement, 1, ids[frame]);
++    if(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) > 0)
++      verified++;
++    sqlite3_reset(statement);
++  }
++  sqlite3_finalize(statement);
++
++  printf("{\n"
++         "  \"requested\": %zu,\n"
++         "  \"analyzed\": %zu,\n"
++         "  \"histories_written\": %zu,\n"
++         "  \"histories_verified\": %zu,\n"
++         "  \"base_mode\": %d,\n"
++         "  \"analysis_seconds\": %.6f,\n"
++         "  \"history_seconds\": %.6f,\n"
++         "  \"total_seconds\": %.6f,\n"
++         "  \"seconds_per_image\": %.6f\n"
++         "}\n",
++         requested, analyzed, written, verified, status == 0 ? roll.base_mode : -1,
++         analysis_seconds, history_seconds, total_seconds,
++         analyzed ? total_seconds / analyzed : 0.0);
++
++  g_free(frames);
++  g_free(ids);
++  dt_cleanup();
++  return status == 0 && written == analyzed && verified == written ? 0 : 1;
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/common/film_analysis.c b/src/common/film_analysis.c
+new file mode 100644
+index 0000000..87ef030
+--- /dev/null
++++ b/src/common/film_analysis.c
+@@ -0,0 +1,319 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include "common/film_analysis.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define DT_FILM_HISTOGRAM_BINS 4096u
++#define DT_FILM_EPSILON 1.0e-8f
++
++static float _clampf(const float value, const float low, const float high)
++{
++  return value < low ? low : (value > high ? high : value);
++}
++
++static size_t _sample_step(const size_t width, const size_t height, const size_t limit)
++{
++  if(limit == 0 || width == 0 || height == 0) return 1;
++  const double ratio = (double)width * (double)height / (double)limit;
++  return ratio > 1.0 ? (size_t)ceil(sqrt(ratio)) : 1;
++}
++
++static float _histogram_quantile(const uint32_t *histogram,
++                                 const size_t bins,
++                                 const size_t count,
++                                 const float percentile,
++                                 const float maximum)
++{
++  if(count == 0) return 0.0f;
++  const size_t target = (size_t)floor(_clampf(percentile, 0.0f, 1.0f) * (float)(count - 1));
++  size_t seen = 0;
++  for(size_t bin = 0; bin < bins; bin++)
++  {
++    seen += histogram[bin];
++    if(seen > target) return maximum * ((float)bin + 0.5f) / (float)bins;
++  }
++  return maximum;
++}
++
++static void _add_histogram_sample(uint32_t *histogram, const float value, const float maximum)
++{
++  const float normalized = _clampf(value / maximum, 0.0f, 1.0f);
++  const size_t bin = (size_t)fminf(floorf(normalized * DT_FILM_HISTOGRAM_BINS),
++                                  (float)(DT_FILM_HISTOGRAM_BINS - 1));
++  histogram[bin]++;
++}
++
++dt_film_analysis_config_t dt_film_analysis_default_config(const dt_film_stock_t stock)
++{
++  return (dt_film_analysis_config_t){
++    .stock = stock,
++    .border_fraction = 0.08f,
++    .base_percentile = 0.95f,
++    .density_floor_percentile = 0.005f,
++    .density_ceiling_percentile = 0.995f,
++    .maximum_density = 6.0f,
++    .input_ceiling = 0.0f,
++    .sample_limit = 1000000,
++  };
++}
++
++static int _analyze_f32(const float *const rgb,
++                        const size_t width,
++                        const size_t height,
++                        const size_t row_stride,
++                        const size_t pixel_stride,
++                        const dt_film_analysis_config_t *const config,
++                        dt_film_analysis_result_t *const result)
++{
++  if(!rgb || !config || !result || width < 8 || height < 8 || pixel_stride < 3
++     || row_stride < width * pixel_stride
++     || config->maximum_density <= 0.0f)
++    return -1;
++
++  memset(result, 0, sizeof(*result));
++
++  uint32_t *const base_histogram = calloc(3 * DT_FILM_HISTOGRAM_BINS, sizeof(uint32_t));
++  uint32_t *const global_histogram = calloc(3 * DT_FILM_HISTOGRAM_BINS, sizeof(uint32_t));
++  uint32_t *const density_histogram = calloc(3 * DT_FILM_HISTOGRAM_BINS, sizeof(uint32_t));
++  if(!base_histogram || !global_histogram || !density_histogram)
++  {
++    free(base_histogram);
++    free(global_histogram);
++    free(density_histogram);
++    return -2;
++  }
++
++  const size_t step = _sample_step(width, height, config->sample_limit);
++  const float border_fraction = _clampf(config->border_fraction, 0.01f, 0.45f);
++  const size_t border_x = (size_t)fmaxf(1.0f, floorf((float)width * border_fraction));
++  const size_t border_y = (size_t)fmaxf(1.0f, floorf((float)height * border_fraction));
++  float observed_maximum[3] = { DT_FILM_EPSILON, DT_FILM_EPSILON, DT_FILM_EPSILON };
++  double border_sum[3] = { 0.0, 0.0, 0.0 };
++  double border_sum_squared[3] = { 0.0, 0.0, 0.0 };
++
++  /* First pass: obtain a scale. */
++  size_t global_samples = 0;
++  for(size_t y = 0; y < height; y += step)
++  {
++    const float *const row = rgb + y * row_stride;
++    for(size_t x = 0; x < width; x += step)
++    {
++      const float *const pixel = row + pixel_stride * x;
++      for(size_t channel = 0; channel < 3; channel++)
++        if(isfinite(pixel[channel]) && pixel[channel] > observed_maximum[channel])
++          observed_maximum[channel] = pixel[channel];
++    }
++  }
++
++  for(size_t y = 0; y < height; y += step)
++  {
++    const float *const row = rgb + y * row_stride;
++    for(size_t x = 0; x < width; x += step)
++    {
++      const float *const pixel = row + pixel_stride * x;
++      int valid = 1;
++      for(size_t channel = 0; channel < 3; channel++)
++        valid &= isfinite(pixel[channel]) && pixel[channel] > DT_FILM_EPSILON;
++      if(!valid) continue;
++
++      for(size_t channel = 0; channel < 3; channel++)
++        _add_histogram_sample(global_histogram + channel * DT_FILM_HISTOGRAM_BINS,
++                              pixel[channel], observed_maximum[channel]);
++      global_samples++;
++
++      if(x < border_x || x >= width - border_x || y < border_y || y >= height - border_y)
++      {
++        for(size_t channel = 0; channel < 3; channel++)
++        {
++          _add_histogram_sample(base_histogram + channel * DT_FILM_HISTOGRAM_BINS,
++                                pixel[channel], observed_maximum[channel]);
++          border_sum[channel] += pixel[channel];
++          border_sum_squared[channel] += (double)pixel[channel] * pixel[channel];
++        }
++        result->sampled_border_pixels++;
++      }
++    }
++  }
++
++  if(result->sampled_border_pixels < 32)
++  {
++    free(base_histogram);
++    free(global_histogram);
++    free(density_histogram);
++    return -3;
++  }
++
++  float border_base[3], global_base[3];
++  float border_to_global = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    border_base[channel] = _histogram_quantile(
++      base_histogram + channel * DT_FILM_HISTOGRAM_BINS,
++      DT_FILM_HISTOGRAM_BINS,
++      result->sampled_border_pixels,
++      config->base_percentile,
++      observed_maximum[channel]);
++    global_base[channel] = _histogram_quantile(
++      global_histogram + channel * DT_FILM_HISTOGRAM_BINS,
++      DT_FILM_HISTOGRAM_BINS,
++      global_samples,
++      0.98f,
++      observed_maximum[channel]);
++    border_to_global += border_base[channel] / fmaxf(global_base[channel], DT_FILM_EPSILON);
++  }
++  border_to_global /= 3.0f;
++  const int use_global_base = border_to_global < 0.55f;
++  for(size_t channel = 0; channel < 3; channel++)
++    result->film_base[channel] = use_global_base ? global_base[channel] : border_base[channel];
++  if(use_global_base) result->warnings |= DT_FILM_ANALYSIS_WARNING_NO_REBATE;
++  result->film_base[3] = 1.0f;
++
++  float relative_border_spread = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    const double mean = border_sum[channel] / (double)result->sampled_border_pixels;
++    const double variance = fmax(0.0, border_sum_squared[channel]
++                                      / (double)result->sampled_border_pixels - mean * mean);
++    relative_border_spread += sqrtf((float)variance)
++                              / fmaxf(result->film_base[channel], DT_FILM_EPSILON);
++  }
++  if(relative_border_spread / 3.0f > 0.25f)
++    result->warnings |= DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE;
++
++  /* Second pass: measure density only inside the analysis crop. */
++  for(size_t y = border_y; y < height - border_y; y += step)
++  {
++    const float *const row = rgb + y * row_stride;
++    for(size_t x = border_x; x < width - border_x; x += step)
++    {
++      const float *const pixel = row + pixel_stride * x;
++      int valid = 1;
++      for(size_t channel = 0; channel < 3; channel++)
++        valid &= isfinite(pixel[channel]) && pixel[channel] > DT_FILM_EPSILON;
++      if(!valid) continue;
++
++      for(size_t channel = 0; channel < 3; channel++)
++      {
++        const float density = _clampf(log10f(result->film_base[channel]
++                                             / fmaxf(pixel[channel], DT_FILM_EPSILON)),
++                                      0.0f, config->maximum_density);
++        _add_histogram_sample(density_histogram + channel * DT_FILM_HISTOGRAM_BINS,
++                              density, config->maximum_density);
++      }
++      result->sampled_pixels++;
++    }
++  }
++
++  if(result->sampled_pixels < 32)
++  {
++    free(base_histogram);
++    free(global_histogram);
++    free(density_histogram);
++    return -4;
++  }
++
++  float range_sum = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    const uint32_t *const histogram = density_histogram + channel * DT_FILM_HISTOGRAM_BINS;
++    result->density_floor[channel] = _histogram_quantile(histogram, DT_FILM_HISTOGRAM_BINS,
++                                                         result->sampled_pixels,
++                                                         config->density_floor_percentile,
++                                                         config->maximum_density);
++    result->density_median[channel] = _histogram_quantile(histogram, DT_FILM_HISTOGRAM_BINS,
++                                                          result->sampled_pixels, 0.5f,
++                                                          config->maximum_density);
++    result->density_ceiling[channel] = _histogram_quantile(histogram, DT_FILM_HISTOGRAM_BINS,
++                                                           result->sampled_pixels,
++                                                           config->density_ceiling_percentile,
++                                                           config->maximum_density);
++    range_sum += result->density_ceiling[channel] - result->density_floor[channel];
++  }
++
++  result->negadoctor_dmax = fmaxf(range_sum / 3.0f, 0.1f);
++  float floor_sum = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    const float range = fmaxf(result->density_ceiling[channel]
++                              - result->density_floor[channel], 0.1f);
++    result->negadoctor_wb_high[channel] = result->negadoctor_dmax / range;
++    floor_sum += result->density_floor[channel];
++  }
++  result->negadoctor_wb_high[3] = 1.0f;
++  result->negadoctor_offset = (floor_sum / 3.0f) / result->negadoctor_dmax;
++
++  const float minimum_range = fminf(result->density_ceiling[0] - result->density_floor[0],
++                                    fminf(result->density_ceiling[1] - result->density_floor[1],
++                                          result->density_ceiling[2] - result->density_floor[2]));
++  if(minimum_range < 0.15f) result->warnings |= DT_FILM_ANALYSIS_WARNING_LOW_RANGE;
++
++  const float border_coverage = fminf((float)result->sampled_border_pixels / 5000.0f, 1.0f);
++  const float range_quality = _clampf(minimum_range / 1.0f, 0.0f, 1.0f);
++  result->confidence = 0.35f * border_coverage + 0.65f * range_quality;
++
++  /* Film base should normally be the brightest part of the image, so it cannot
++   * be diagnosed as clipped from the observed frame maximum. Only callers
++   * with a known representation ceiling may request this warning. */
++  if(config->input_ceiling > 0.0f)
++    for(size_t channel = 0; channel < 3; channel++)
++      if(result->film_base[channel] >= config->input_ceiling * 0.995f)
++        result->warnings |= DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE;
++
++  free(base_histogram);
++  free(global_histogram);
++  free(density_histogram);
++  return 0;
++}
++
++int dt_film_analyze_rgb_f32(const float *const rgb,
++                            const size_t width,
++                            const size_t height,
++                            const size_t row_stride,
++                            const dt_film_analysis_config_t *const config,
++                            dt_film_analysis_result_t *const result)
++{
++  return _analyze_f32(rgb, width, height, row_stride, 3, config, result);
++}
++
++int dt_film_analyze_rgba_f32(const float *const rgba,
++                             const size_t width,
++                             const size_t height,
++                             const size_t row_stride,
++                             const dt_film_analysis_config_t *const config,
++                             dt_film_analysis_result_t *const result)
++{
++  return _analyze_f32(rgba, width, height, row_stride, 4, config, result);
++}
++
++void dt_film_apply_auto_negadoctor_pixel(const float input[3],
++                                         const dt_film_analysis_result_t *const analysis,
++                                         float output[3])
++{
++  if(!input || !analysis || !output) return;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    const float density = log10f(fmaxf(input[channel], DT_FILM_EPSILON)
++                                 / fmaxf(analysis->film_base[channel], DT_FILM_EPSILON));
++    const float corrected = analysis->negadoctor_wb_high[channel]
++                            / fmaxf(analysis->negadoctor_dmax, 0.1f) * density
++                            + analysis->negadoctor_offset;
++    output[channel] = _clampf(1.0f - powf(10.0f, corrected), 0.0f, 1.0f);
++  }
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/common/film_analysis.h b/src/common/film_analysis.h
+new file mode 100644
+index 0000000..bf401d5
+--- /dev/null
++++ b/src/common/film_analysis.h
+@@ -0,0 +1,94 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++typedef enum dt_film_stock_t
++{
++  DT_FILM_STOCK_MONOCHROME = 0,
++  DT_FILM_STOCK_COLOR = 1
++} dt_film_stock_t;
++
++typedef enum dt_film_analysis_warning_t
++{
++  DT_FILM_ANALYSIS_WARNING_NONE = 0,
++  DT_FILM_ANALYSIS_WARNING_NO_REBATE = 1u << 0,
++  DT_FILM_ANALYSIS_WARNING_LOW_RANGE = 1u << 1,
++  DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE = 1u << 2,
++  DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE = 1u << 3
++} dt_film_analysis_warning_t;
++
++typedef struct dt_film_analysis_config_t
++{
++  dt_film_stock_t stock;
++  float border_fraction;
++  float base_percentile;
++  float density_floor_percentile;
++  float density_ceiling_percentile;
++  float maximum_density;
++  /* Set only when the caller knows the linear buffer's clipping ceiling.
++   * Zero means unbounded/unknown, as in darktable's working RGB pipeline. */
++  float input_ceiling;
++  size_t sample_limit;
++} dt_film_analysis_config_t;
++
++typedef struct dt_film_analysis_result_t
++{
++  float film_base[4];
++  float density_floor[4];
++  float density_median[4];
++  float density_ceiling[4];
++
++  /* Parameters map directly onto negadoctor's technical controls. */
++  float negadoctor_dmax;
++  float negadoctor_offset;
++  float negadoctor_wb_high[4];
++
++  float confidence;
++  size_t sampled_pixels;
++  size_t sampled_border_pixels;
++  uint32_t warnings;
++} dt_film_analysis_result_t;
++
++dt_film_analysis_config_t dt_film_analysis_default_config(dt_film_stock_t stock);
++
++/*
++ * Analyze non-negative, scene-linear RGB pixels. `row_stride` is measured in
++ * floats and pixels are RGB-interleaved. The image is never retained.
++ *
++ * Returns zero on success and a negative value for invalid input or an image
++ * without enough usable samples.
++ */
++int dt_film_analyze_rgb_f32(const float *rgb,
++                            size_t width,
++                            size_t height,
++                            size_t row_stride,
++                            const dt_film_analysis_config_t *config,
++                            dt_film_analysis_result_t *result);
++
++/* Analyze darktable's native four-channel float pixel buffers without making
++ * a temporary RGB copy. The alpha channel is ignored. */
++int dt_film_analyze_rgba_f32(const float *rgba,
++                             size_t width,
++                             size_t height,
++                             size_t row_stride,
++                             const dt_film_analysis_config_t *config,
++                             dt_film_analysis_result_t *result);
++
++/*
++ * Small CPU reference for the automatically-derived negadoctor technical
++ * parameters. Creative paper controls intentionally stay outside analysis.
++ */
++void dt_film_apply_auto_negadoctor_pixel(const float input[3],
++                                         const dt_film_analysis_result_t *analysis,
++                                         float output[3]);
+diff --git a/src/common/film_roll_analysis.c b/src/common/film_roll_analysis.c
+new file mode 100644
+index 0000000..13f862a
+--- /dev/null
++++ b/src/common/film_roll_analysis.c
+@@ -0,0 +1,239 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include "common/film_roll_analysis.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++static int _compare_float(const void *const left, const void *const right)
++{
++  const float a = *(const float *)left;
++  const float b = *(const float *)right;
++  return (a > b) - (a < b);
++}
++
++static float _quantile(float *const values, const size_t count, const float percentile)
++{
++  if(count == 0) return 0.0f;
++  qsort(values, count, sizeof(float), _compare_float);
++  const float position = fmaxf(0.0f, fminf(1.0f, percentile)) * (float)(count - 1);
++  const size_t low = (size_t)floorf(position);
++  const size_t high = (size_t)ceilf(position);
++  const float fraction = position - (float)low;
++  return values[low] * (1.0f - fraction) + values[high] * fraction;
++}
++
++static int _valid_base(const float base[4])
++{
++  if(!base) return 0;
++  for(size_t channel = 0; channel < 3; channel++)
++    if(!isfinite(base[channel]) || base[channel] <= 0.0f) return 0;
++  return 1;
++}
++
++int dt_film_analyze_roll(const dt_film_analysis_result_t *const frames,
++                         const size_t frame_count,
++                         const float explicit_base[4],
++                         const dt_film_base_prior_t *const borrowed_prior,
++                         dt_film_roll_analysis_result_t *const result)
++{
++  if(!frames || frame_count == 0 || !result) return -1;
++  memset(result, 0, sizeof(*result));
++  result->frame_count = frame_count;
++  result->film_base[3] = 1.0f;
++  result->negadoctor_wb_high[3] = 1.0f;
++
++  size_t accepted_count = 0;
++  size_t measured_count = 0;
++  size_t first_accepted = frame_count;
++  for(size_t index = 0; index < frame_count; index++)
++  {
++    const int rejected = frames[index].confidence < 0.2f
++                         || (frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE);
++    if(rejected)
++      result->frames_rejected++;
++    else
++    {
++      if(first_accepted == frame_count) first_accepted = index;
++      accepted_count++;
++      if(!(frames[index].warnings & (DT_FILM_ANALYSIS_WARNING_NO_REBATE
++                                     | DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE)))
++        measured_count++;
++    }
++  }
++  if(accepted_count == 0) return -2;
++  result->frames_used = accepted_count;
++  if(result->frames_rejected > 0) result->warnings |= DT_FILM_ROLL_WARNING_REJECTED_FRAMES;
++
++  float *const scratch = malloc(frame_count * sizeof(float));
++  if(!scratch) return -3;
++
++  if(_valid_base(explicit_base))
++  {
++    result->base_mode = DT_FILM_BASE_EXPLICIT_REFERENCE;
++    memcpy(result->film_base, explicit_base, 3 * sizeof(float));
++    result->base_confidence = 1.0f;
++  }
++  else if(measured_count > 0)
++  {
++    result->base_mode = DT_FILM_BASE_MEASURED_REBATE;
++    for(size_t channel = 0; channel < 3; channel++)
++    {
++      size_t count = 0;
++      for(size_t index = 0; index < frame_count; index++)
++        if(frames[index].confidence >= 0.2f
++           && !(frames[index].warnings & (DT_FILM_ANALYSIS_WARNING_NO_REBATE
++                                          | DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE
++                                          | DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE)))
++          scratch[count++] = frames[index].film_base[channel];
++      result->film_base[channel] = _quantile(scratch, count, 0.5f);
++    }
++    result->base_confidence = fminf(0.95f, 0.7f + 0.05f * (float)measured_count);
++  }
++  else if(accepted_count >= 3)
++  {
++    result->base_mode = DT_FILM_BASE_INFERRED_ROLL;
++    result->warnings |= DT_FILM_ROLL_WARNING_BASE_INFERRED;
++    for(size_t channel = 0; channel < 3; channel++)
++    {
++      size_t count = 0;
++      for(size_t index = 0; index < frame_count; index++)
++        if(frames[index].confidence >= 0.2f
++           && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++          scratch[count++] = frames[index].film_base[channel];
++      /* Film base is an upper transmission envelope; use the robust upper
++       * quartile across frames rather than requiring a blank frame. */
++      result->film_base[channel] = _quantile(scratch, count, 0.75f);
++    }
++    result->base_confidence = fminf(0.85f, 0.45f + 0.05f * (float)accepted_count);
++  }
++  else if(borrowed_prior && _valid_base(borrowed_prior->film_base))
++  {
++    result->base_mode = DT_FILM_BASE_BORROWED_PRIOR;
++    result->warnings |= DT_FILM_ROLL_WARNING_BASE_BORROWED;
++    memcpy(result->film_base, borrowed_prior->film_base, 3 * sizeof(float));
++    result->base_confidence = fminf(fmaxf(borrowed_prior->confidence, 0.0f), 0.65f);
++  }
++  else
++  {
++    result->base_mode = DT_FILM_BASE_PER_FRAME_FALLBACK;
++    result->warnings |= DT_FILM_ROLL_WARNING_SINGLE_FRAME;
++    memcpy(result->film_base, frames[first_accepted].film_base, 3 * sizeof(float));
++    result->base_confidence = fminf(frames[first_accepted].confidence, 0.4f);
++  }
++
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    size_t count = 0;
++    for(size_t index = 0; index < frame_count; index++)
++      if(frames[index].confidence >= 0.2f
++         && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++        scratch[count++] = frames[index].density_floor[channel];
++    result->density_floor[channel] = _quantile(scratch, count, 0.5f);
++
++    count = 0;
++    for(size_t index = 0; index < frame_count; index++)
++      if(frames[index].confidence >= 0.2f
++         && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++        scratch[count++] = frames[index].density_median[channel];
++    result->density_median[channel] = _quantile(scratch, count, 0.5f);
++
++    count = 0;
++    for(size_t index = 0; index < frame_count; index++)
++      if(frames[index].confidence >= 0.2f
++         && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++        scratch[count++] = frames[index].density_ceiling[channel];
++    result->density_ceiling[channel] = _quantile(scratch, count, 0.5f);
++
++    count = 0;
++    for(size_t index = 0; index < frame_count; index++)
++      if(frames[index].confidence >= 0.2f
++         && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++        scratch[count++] = frames[index].negadoctor_wb_high[channel];
++    result->negadoctor_wb_high[channel] = _quantile(scratch, count, 0.5f);
++  }
++
++  size_t dmax_count = 0;
++  for(size_t index = 0; index < frame_count; index++)
++    if(frames[index].confidence >= 0.2f
++       && !(frames[index].warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE))
++      scratch[dmax_count++] = frames[index].negadoctor_dmax;
++  result->negadoctor_dmax = _quantile(scratch, dmax_count, 0.5f);
++
++  const float coverage = (float)accepted_count / (float)frame_count;
++  result->roll_confidence = result->base_confidence * (0.6f + 0.4f * coverage);
++  free(scratch);
++  return 0;
++}
++
++int dt_film_apply_roll_baseline(const dt_film_analysis_result_t *const frame,
++                                const dt_film_roll_analysis_result_t *const roll,
++                                dt_film_analysis_result_t *const result)
++{
++  if(!frame || !roll || !result || !_valid_base(frame->film_base)
++     || !_valid_base(roll->film_base))
++    return -1;
++
++  dt_film_analysis_result_t adjusted = *frame;
++  float shifted_floor_mean = 0.0f;
++  float shifted_median_mean = 0.0f;
++  float roll_floor_mean = 0.0f;
++  float roll_median_mean = 0.0f;
++  float ranges[3];
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    const float base_shift = log10f(roll->film_base[channel]
++                                     / fmaxf(frame->film_base[channel], 1.0e-8f));
++    shifted_floor_mean += frame->density_floor[channel] + base_shift;
++    shifted_median_mean += frame->density_median[channel] + base_shift;
++    roll_floor_mean += roll->density_floor[channel];
++    roll_median_mean += roll->density_median[channel];
++    ranges[channel] = fmaxf(roll->density_ceiling[channel]
++                             - roll->density_floor[channel], 0.1f);
++  }
++  shifted_floor_mean /= 3.0f;
++  shifted_median_mean /= 3.0f;
++  roll_floor_mean /= 3.0f;
++  roll_median_mean /= 3.0f;
++
++  float dmax = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    adjusted.film_base[channel] = roll->film_base[channel];
++    adjusted.density_floor[channel] = shifted_floor_mean
++                                      + roll->density_floor[channel] - roll_floor_mean;
++    adjusted.density_median[channel] = shifted_median_mean
++                                       + roll->density_median[channel] - roll_median_mean;
++    adjusted.density_ceiling[channel] = adjusted.density_floor[channel] + ranges[channel];
++    dmax += ranges[channel];
++  }
++  adjusted.film_base[3] = 1.0f;
++  dmax /= 3.0f;
++  adjusted.negadoctor_dmax = dmax;
++  float floor_mean = 0.0f;
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    adjusted.negadoctor_wb_high[channel] = dmax / ranges[channel];
++    floor_mean += adjusted.density_floor[channel];
++  }
++  adjusted.negadoctor_wb_high[3] = 1.0f;
++  adjusted.negadoctor_offset = floor_mean / 3.0f / fmaxf(dmax, 0.1f);
++  adjusted.confidence = fminf(frame->confidence, roll->roll_confidence);
++  *result = adjusted;
++  return 0;
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/common/film_roll_analysis.h b/src/common/film_roll_analysis.h
+new file mode 100644
+index 0000000..5f11d8e
+--- /dev/null
++++ b/src/common/film_roll_analysis.h
+@@ -0,0 +1,76 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#pragma once
++
++#include "common/film_analysis.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++typedef enum dt_film_base_mode_t
++{
++  DT_FILM_BASE_EXPLICIT_REFERENCE = 0,
++  DT_FILM_BASE_MEASURED_REBATE = 1,
++  DT_FILM_BASE_INFERRED_ROLL = 2,
++  DT_FILM_BASE_BORROWED_PRIOR = 3,
++  DT_FILM_BASE_PER_FRAME_FALLBACK = 4
++} dt_film_base_mode_t;
++
++typedef enum dt_film_roll_warning_t
++{
++  DT_FILM_ROLL_WARNING_NONE = 0,
++  DT_FILM_ROLL_WARNING_BASE_INFERRED = 1u << 0,
++  DT_FILM_ROLL_WARNING_BASE_BORROWED = 1u << 1,
++  DT_FILM_ROLL_WARNING_SINGLE_FRAME = 1u << 2,
++  DT_FILM_ROLL_WARNING_REJECTED_FRAMES = 1u << 3
++} dt_film_roll_warning_t;
++
++typedef struct dt_film_base_prior_t
++{
++  float film_base[4];
++  float confidence;
++} dt_film_base_prior_t;
++
++typedef struct dt_film_roll_analysis_result_t
++{
++  dt_film_base_mode_t base_mode;
++  float film_base[4];
++  float density_floor[4];
++  float density_median[4];
++  float density_ceiling[4];
++  float negadoctor_dmax;
++  float negadoctor_wb_high[4];
++  float base_confidence;
++  float roll_confidence;
++  size_t frame_count;
++  size_t frames_used;
++  size_t frames_rejected;
++  uint32_t warnings;
++} dt_film_roll_analysis_result_t;
++
++/*
++ * Aggregate immutable per-frame measurements into a roll baseline.
++ *
++ * `explicit_base` may point to four measured channel values from any clean
++ * rebate patch or dedicated base capture. `borrowed_prior` is optional and is
++ * used only when the roll itself cannot support inference. Neither is required.
++ */
++int dt_film_analyze_roll(const dt_film_analysis_result_t *frames,
++                         size_t frame_count,
++                         const float explicit_base[4],
++                         const dt_film_base_prior_t *borrowed_prior,
++                         dt_film_roll_analysis_result_t *result);
++
++/* Apply shared roll color/range statistics while retaining the frame's mean
++ * luminance placement. `frame` and `result` may point to the same object. */
++int dt_film_apply_roll_baseline(const dt_film_analysis_result_t *frame,
++                                const dt_film_roll_analysis_result_t *roll,
++                                dt_film_analysis_result_t *result);
+diff --git a/src/common/film_roll_workflow.c b/src/common/film_roll_workflow.c
+new file mode 100644
+index 0000000..aea5947
+--- /dev/null
++++ b/src/common/film_roll_workflow.c
+@@ -0,0 +1,184 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include "common/film_roll_workflow.h"
++
++#include "common/image.h"
++#include "common/iop_order.h"
++#include "common/mipmap_cache.h"
++#include "develop/develop.h"
++#include "develop/imageop.h"
++#include "develop/pixelpipe.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <string.h>
++
++/* Stable Negadoctor v2 history wire layout. Keep this local to the history
++ * bridge: the plugin's introspected parameter struct remains its authority. */
++typedef struct dt_film_negadoctor_params_v2_t
++{
++  int32_t film_stock;
++  float Dmin[4];
++  float wb_high[4];
++  float wb_low[4];
++  float D_max;
++  float offset;
++  float black;
++  float gamma;
++  float soft_clip;
++  float exposure;
++} dt_film_negadoctor_params_v2_t;
++
++_Static_assert(sizeof(dt_film_negadoctor_params_v2_t) == 76,
++               "unexpected Negadoctor v2 parameter layout");
++
++int dt_film_analyze_image_proxy(const dt_imgid_t imgid,
++                                const dt_film_stock_t stock,
++                                const int maximum_dimension,
++                                dt_film_analysis_result_t *const result)
++{
++  if(!dt_is_valid_imgid(imgid) || maximum_dimension < 256 || !result) return -1;
++
++  int status = -2;
++  dt_develop_t dev;
++  dt_dev_init(&dev, FALSE);
++  dt_dev_load_image(&dev, imgid);
++
++  dt_mipmap_buffer_t buffer;
++  dt_mipmap_cache_get(&buffer, imgid, DT_MIPMAP_F, DT_MIPMAP_BLOCKING, 'r');
++  if(!buffer.buf || !buffer.width || !buffer.height) goto cleanup_dev;
++
++  const int input_width = buffer.width;
++  const int input_height = buffer.height;
++  dt_dev_pixelpipe_t pipe;
++  if(!dt_dev_pixelpipe_init_export(&pipe, input_width, input_height, IMAGEIO_FLOAT, FALSE))
++  {
++    status = -3;
++    goto cleanup_buffer;
++  }
++
++  dt_ioppr_resync_modules_order(&dev);
++  dt_dev_pixelpipe_set_input(&pipe, &dev, (float *)buffer.buf,
++                             input_width, input_height, buffer.iscale);
++  dt_dev_pixelpipe_create_nodes(&pipe, &dev);
++  dt_dev_pixelpipe_synch_all(&pipe, &dev);
++  if(!pipe.nodes)
++  {
++    status = -4;
++    goto cleanup_pipe;
++  }
++
++  dt_dev_pixelpipe_disable_after(&pipe, "negadoctor");
++  gboolean found_negadoctor = FALSE;
++  for(GList *node = pipe.nodes; node; node = g_list_next(node))
++  {
++    dt_dev_pixelpipe_iop_t *const piece = node->data;
++    if(dt_iop_module_is(piece->module, "negadoctor"))
++    {
++      piece->enabled = FALSE;
++      found_negadoctor = TRUE;
++    }
++  }
++  if(!found_negadoctor)
++  {
++    status = -5;
++    goto cleanup_pipe;
++  }
++
++  dt_dev_pixelpipe_get_dimensions(&pipe, &dev, input_width, input_height,
++                                  &pipe.processed_width, &pipe.processed_height);
++  const float scale = fminf(1.0f,
++                            fminf((float)maximum_dimension / pipe.processed_width,
++                                  (float)maximum_dimension / pipe.processed_height));
++  const int output_width = MAX(8, (int)floorf(scale * pipe.processed_width));
++  const int output_height = MAX(8, (int)floorf(scale * pipe.processed_height));
++  dt_dev_pixelpipe_process_no_gamma(&pipe, &dev, 0, 0,
++                                    output_width, output_height, scale);
++  if(!pipe.backbuf || pipe.backbuf_width < 8 || pipe.backbuf_height < 8)
++  {
++    status = -6;
++    goto cleanup_pipe;
++  }
++
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(stock);
++  status = dt_film_analyze_rgba_f32((const float *)pipe.backbuf,
++                                    pipe.backbuf_width, pipe.backbuf_height,
++                                    (size_t)pipe.backbuf_width * 4,
++                                    &config, result);
++
++cleanup_pipe:
++  dt_dev_pixelpipe_cleanup(&pipe);
++cleanup_buffer:
++  dt_mipmap_cache_release(&buffer);
++cleanup_dev:
++  dt_dev_cleanup(&dev);
++  /* Roll jobs are intentionally bounded-memory. The analysis result no longer
++   * needs this float preview, so don't retain a roll's worth of them. */
++  dt_mipmap_cache_evict_at_size(imgid, DT_MIPMAP_F);
++  return status;
++}
++
++int dt_film_write_roll_history(const dt_imgid_t imgid,
++                               const dt_film_stock_t stock,
++                               const dt_film_analysis_result_t *const frame,
++                               const dt_film_roll_analysis_result_t *const roll)
++{
++  if(!dt_is_valid_imgid(imgid) || !frame || !roll) return -1;
++  dt_film_analysis_result_t adjusted;
++  if(dt_film_apply_roll_baseline(frame, roll, &adjusted) != 0) return -2;
++
++  int status = 0;
++  dt_develop_t dev;
++  dt_dev_init(&dev, FALSE);
++  dt_dev_load_image(&dev, imgid);
++  dt_iop_module_t *const module = dt_iop_get_module_by_op_priority(dev.iop, "negadoctor", 0);
++  if(!module || module->version() != 2
++     || module->params_size != sizeof(dt_film_negadoctor_params_v2_t))
++  {
++    status = -3;
++    goto cleanup;
++  }
++
++  dt_film_negadoctor_params_v2_t *const params = module->params;
++  params->film_stock = stock == DT_FILM_STOCK_MONOCHROME ? 0 : 1;
++  if(stock == DT_FILM_STOCK_MONOCHROME)
++  {
++    const float neutral = (adjusted.film_base[0] + adjusted.film_base[1]
++                           + adjusted.film_base[2]) / 3.0f;
++    for(size_t channel = 0; channel < 3; channel++) params->Dmin[channel] = neutral;
++  }
++  else
++    for(size_t channel = 0; channel < 3; channel++)
++      params->Dmin[channel] = adjusted.film_base[channel];
++
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    params->Dmin[channel] = CLAMP(params->Dmin[channel], 0.00001f, 1.5f);
++    params->wb_high[channel] = CLAMP(adjusted.negadoctor_wb_high[channel], 0.25f, 2.0f);
++    params->wb_low[channel] = 1.0f;
++  }
++  params->Dmin[3] = params->wb_high[3] = params->wb_low[3] = 1.0f;
++  params->D_max = CLAMP(adjusted.negadoctor_dmax, 0.1f, 6.0f);
++  params->offset = CLAMP(adjusted.negadoctor_offset, -1.0f, 1.0f);
++
++  dt_dev_add_history_item_ext(&dev, module, TRUE, TRUE);
++  dt_dev_write_history_ext(&dev, imgid);
++
++cleanup:
++  dt_dev_cleanup(&dev);
++  return status;
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/common/film_roll_workflow.h b/src/common/film_roll_workflow.h
+new file mode 100644
+index 0000000..973c235
+--- /dev/null
++++ b/src/common/film_roll_workflow.h
+@@ -0,0 +1,30 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#pragma once
++
++#include "common/darktable.h"
++#include "common/film_analysis.h"
++#include "common/film_roll_analysis.h"
++
++/* Render a bounded linear-working-RGB proxy up to Negadoctor's input and
++ * analyze it. Existing upstream edits and geometry are respected. */
++int dt_film_analyze_image_proxy(dt_imgid_t imgid,
++                                dt_film_stock_t stock,
++                                int maximum_dimension,
++                                dt_film_analysis_result_t *result);
++
++/* Append one enabled Negadoctor history item using shared roll color/range
++ * statistics and this frame's retained luminance placement. Creative paper
++ * parameters already present on the image are preserved. */
++int dt_film_write_roll_history(dt_imgid_t imgid,
++                               dt_film_stock_t stock,
++                               const dt_film_analysis_result_t *frame,
++                               const dt_film_roll_analysis_result_t *roll);
+diff --git a/src/libs/film_roll.c b/src/libs/film_roll.c
+new file mode 100644
+index 0000000..4957731
+--- /dev/null
++++ b/src/libs/film_roll.c
+@@ -0,0 +1,287 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include "bauhaus/bauhaus.h"
++#include "common/act_on.h"
++#include "common/collection.h"
++#include "common/darktable.h"
++#include "common/film_roll_workflow.h"
++#include "common/history_snapshot.h"
++#include "common/image.h"
++#include "common/image_cache.h"
++#include "common/mipmap_cache.h"
++#include "common/tags.h"
++#include "common/undo.h"
++#include "control/control.h"
++#include "control/jobs.h"
++#include "gui/accelerators.h"
++#include "gui/gtk.h"
++#include "libs/lib.h"
++#include "libs/lib_api.h"
++
++#include <gtk/gtk.h>
++
++#define FILM_ROLL_PROXY_DIMENSION 1600
++
++DT_MODULE(1)
++
++typedef struct dt_lib_film_roll_t
++{
++  GtkWidget *stock;
++  GtkWidget *process;
++  GtkWidget *status;
++  gint running;
++} dt_lib_film_roll_t;
++
++typedef struct dt_film_roll_job_t
++{
++  GList *images;
++  dt_film_stock_t stock;
++  GtkWidget *button;
++  GtkWidget *status;
++  gint *running;
++} dt_film_roll_job_t;
++
++typedef struct dt_film_roll_completion_t
++{
++  GtkWidget *button;
++  GtkWidget *status;
++  gint *running;
++  gchar *message;
++} dt_film_roll_completion_t;
++
++const char *name(dt_lib_module_t *self)
++{
++  return _("film roll");
++}
++
++const char *description(dt_lib_module_t *self)
++{
++  return _("analyze selected negative scans as one roll and write shared Negadoctor history");
++}
++
++dt_view_type_flags_t views(dt_lib_module_t *self)
++{
++  return DT_VIEW_LIGHTTABLE;
++}
++
++uint32_t container(dt_lib_module_t *self)
++{
++  return DT_UI_CONTAINER_PANEL_RIGHT_CENTER;
++}
++
++int position(const dt_lib_module_t *self)
++{
++  return 705;
++}
++
++static gboolean _job_complete_idle(gpointer user_data)
++{
++  dt_film_roll_completion_t *const completion = user_data;
++  gtk_label_set_text(GTK_LABEL(completion->status), completion->message);
++  gtk_widget_set_sensitive(completion->button, TRUE);
++  g_atomic_int_set(completion->running, 0);
++  g_object_unref(completion->button);
++  g_object_unref(completion->status);
++  g_free(completion->message);
++  g_free(completion);
++  return G_SOURCE_REMOVE;
++}
++
++static void _schedule_completion(dt_film_roll_job_t *const data,
++                                 const gchar *const message)
++{
++  dt_film_roll_completion_t *const completion = g_new0(dt_film_roll_completion_t, 1);
++  completion->button = g_object_ref(data->button);
++  completion->status = g_object_ref(data->status);
++  completion->running = data->running;
++  completion->message = g_strdup(message);
++  gdk_threads_add_idle(_job_complete_idle, completion);
++}
++
++static int32_t _film_roll_job_run(dt_job_t *job)
++{
++  dt_film_roll_job_t *const data = dt_control_job_get_params(job);
++  const size_t requested = g_list_length(data->images);
++  dt_imgid_t *const image_ids = g_new(dt_imgid_t, requested);
++  dt_film_analysis_result_t *const frames = g_new0(dt_film_analysis_result_t, requested);
++  size_t analyzed = 0;
++  size_t failed = 0;
++  const double started = dt_get_wtime();
++
++  dt_control_job_set_progress_message(job,
++                                      ngettext("analyzing %zu negative",
++                                               "analyzing %zu negatives", requested),
++                                      requested);
++  size_t index = 0;
++  for(GList *item = data->images; item; item = g_list_next(item), index++)
++  {
++    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) break;
++    const dt_imgid_t imgid = GPOINTER_TO_INT(item->data);
++    dt_film_analysis_result_t frame;
++    if(dt_film_analyze_image_proxy(imgid, data->stock,
++                                   FILM_ROLL_PROXY_DIMENSION, &frame) == 0)
++    {
++      image_ids[analyzed] = imgid;
++      frames[analyzed++] = frame;
++    }
++    else
++      failed++;
++    dt_control_job_set_progress(job, 0.75 * (double)(index + 1) / requested);
++  }
++  const double analysis_seconds = dt_get_wtime() - started;
++
++  dt_film_roll_analysis_result_t roll;
++  if(analyzed == 0 || dt_film_analyze_roll(frames, analyzed, NULL, NULL, &roll) != 0)
++  {
++    const gchar *const message = _("film roll analysis failed: no usable frames");
++    dt_control_log("%s", message);
++    _schedule_completion(data, message);
++    g_free(frames);
++    g_free(image_ids);
++    return 1;
++  }
++
++  const double history_started = dt_get_wtime();
++  size_t written = 0;
++  GList *updated = NULL;
++  dt_undo_start_group(darktable.undo, DT_UNDO_LT_HISTORY);
++  for(size_t frame_index = 0; frame_index < analyzed; frame_index++)
++  {
++    if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED) break;
++    const dt_imgid_t imgid = image_ids[frame_index];
++    dt_undo_lt_history_t *const undo = dt_history_snapshot_item_init();
++    undo->imgid = imgid;
++    dt_history_snapshot_undo_create(imgid, &undo->before, &undo->before_history_end);
++    if(dt_film_write_roll_history(imgid, data->stock, &frames[frame_index], &roll) == 0)
++    {
++      dt_history_snapshot_undo_create(imgid, &undo->after, &undo->after_history_end);
++      dt_undo_record(darktable.undo, NULL, DT_UNDO_LT_HISTORY, (dt_undo_data_t)undo,
++                     dt_history_snapshot_undo_pop,
++                     dt_history_snapshot_undo_lt_history_data_free);
++      updated = g_list_prepend(updated, GINT_TO_POINTER(imgid));
++      dt_image_cache_set_change_timestamp(imgid);
++      dt_mipmap_cache_remove(imgid);
++      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_MIPMAP_UPDATED, imgid);
++      written++;
++    }
++    else
++    {
++      dt_history_snapshot_undo_lt_history_data_free(undo);
++      failed++;
++    }
++    dt_control_job_set_progress(job,
++                                0.75 + 0.25 * (double)(frame_index + 1) / analyzed);
++  }
++  dt_undo_end_group(darktable.undo);
++  const double history_seconds = dt_get_wtime() - history_started;
++
++  if(updated)
++  {
++    guint tagid = 0;
++    dt_tag_new("darktable|changed", &tagid);
++    for(GList *item = updated; item; item = g_list_next(item))
++      dt_tag_attach(tagid, GPOINTER_TO_INT(item->data), FALSE, FALSE);
++    dt_image_synch_xmps(updated);
++    dt_collection_update_query(darktable.collection,
++                               DT_COLLECTION_CHANGE_RELOAD,
++                               DT_COLLECTION_PROP_UNDEF,
++                               g_list_copy(updated));
++    g_list_free(updated);
++  }
++  dt_control_queue_redraw_center();
++
++  const double total_seconds = dt_get_wtime() - started;
++  gchar *const message = g_strdup_printf(
++    _("roll: %zu/%zu histories written in %.1f s (analysis %.1f s, history %.1f s)%s"),
++    written, requested, total_seconds, analysis_seconds, history_seconds,
++    failed ? _(" · some frames failed") : "");
++  dt_control_log("%s", message);
++  _schedule_completion(data, message);
++  g_free(message);
++  g_free(frames);
++  g_free(image_ids);
++  return written == requested ? 0 : 1;
++}
++
++static void _film_roll_job_cleanup(void *user_data)
++{
++  dt_film_roll_job_t *const data = user_data;
++  g_list_free(data->images);
++  g_free(data);
++}
++
++static void _process_clicked(GtkButton *button, dt_lib_module_t *self)
++{
++  dt_lib_film_roll_t *const gui = self->data;
++  if(!g_atomic_int_compare_and_exchange(&gui->running, 0, 1)) return;
++
++  GList *const images = dt_act_on_get_images(TRUE, TRUE, FALSE);
++  if(!images)
++  {
++    g_atomic_int_set(&gui->running, 0);
++    gtk_label_set_text(GTK_LABEL(gui->status), _("select images from one roll first"));
++    return;
++  }
++
++  dt_film_roll_job_t *const data = g_new0(dt_film_roll_job_t, 1);
++  data->images = images;
++  data->stock = dt_bauhaus_combobox_get(gui->stock) == 1
++                  ? DT_FILM_STOCK_MONOCHROME
++                  : DT_FILM_STOCK_COLOR;
++  data->button = gui->process;
++  data->status = gui->status;
++  data->running = &gui->running;
++
++  gtk_widget_set_sensitive(gui->process, FALSE);
++  gtk_label_set_text(GTK_LABEL(gui->status), _("queued…"));
++  dt_job_t *const job = dt_control_job_create(_film_roll_job_run, "film roll analysis");
++  dt_control_job_set_params(job, data, _film_roll_job_cleanup);
++  dt_control_job_add_progress(job, _("film roll analysis"), TRUE);
++  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
++}
++
++void gui_init(dt_lib_module_t *self)
++{
++  dt_lib_film_roll_t *const gui = g_new0(dt_lib_film_roll_t, 1);
++  self->data = gui;
++  self->widget = dt_gui_vbox();
++
++  gui->stock = dt_bauhaus_combobox_new(NULL);
++  dt_bauhaus_widget_set_label(gui->stock, NULL, N_("film type"));
++  dt_bauhaus_combobox_add(gui->stock, _("color negative"));
++  dt_bauhaus_combobox_add(gui->stock, _("black and white negative"));
++  dt_bauhaus_combobox_set(gui->stock, 0);
++
++  gui->process = gtk_button_new_with_label(_("analyze selected roll"));
++  gtk_widget_set_tooltip_text(
++    gui->process,
++    _("analyze selected images together and append shared Negadoctor settings to each history"));
++  dt_action_define(DT_ACTION(self), NULL, N_("analyze selected roll"),
++                   gui->process, &dt_action_def_button);
++  g_signal_connect(G_OBJECT(gui->process), "clicked", G_CALLBACK(_process_clicked), self);
++
++  gui->status = gtk_label_new(_("select scans from exactly one roll"));
++  gtk_label_set_xalign(GTK_LABEL(gui->status), 0.0f);
++  gtk_label_set_line_wrap(GTK_LABEL(gui->status), TRUE);
++  dt_gui_box_add(self->widget, gui->stock, gui->process, gui->status);
++}
++
++void gui_cleanup(dt_lib_module_t *self)
++{
++  g_free(self->data);
++  self->data = NULL;
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/tests/unittests/common/CMakeLists.txt b/src/tests/unittests/common/CMakeLists.txt
+new file mode 100644
+index 0000000..e2e7080
+--- /dev/null
++++ b/src/tests/unittests/common/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_cmocka_test(test_film_analysis
++                SOURCES test_film_analysis.c ../../../common/film_analysis.c
++                LINK_LIBRARIES cmocka m)
++
++target_include_directories(test_film_analysis PRIVATE ../../..)
++
++add_cmocka_test(test_film_roll_analysis
++                SOURCES test_film_roll_analysis.c ../../../common/film_roll_analysis.c
++                LINK_LIBRARIES cmocka m)
++
++target_include_directories(test_film_roll_analysis PRIVATE ../../..)
+diff --git a/src/tests/unittests/common/test_film_analysis.c b/src/tests/unittests/common/test_film_analysis.c
+new file mode 100644
+index 0000000..7895b93
+--- /dev/null
++++ b/src/tests/unittests/common/test_film_analysis.c
+@@ -0,0 +1,176 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include <setjmp.h>
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <cmocka.h>
++#include <math.h>
++
++#include "common/film_analysis.h"
++
++static float *_synthetic_negative(const size_t width, const size_t height, const float base[3])
++{
++  float *const pixels = calloc(width * height * 3, sizeof(float));
++  assert_non_null(pixels);
++  for(size_t y = 0; y < height; y++)
++  {
++    for(size_t x = 0; x < width; x++)
++    {
++      const int border = x < 10 || x >= width - 10 || y < 10 || y >= height - 10;
++      const float density = border ? 0.0f : 0.1f + 1.7f * (float)(x - 10) / (float)(width - 21);
++      for(size_t channel = 0; channel < 3; channel++)
++        pixels[3 * (y * width + x) + channel] = base[channel] * powf(10.0f, -density);
++    }
++  }
++  return pixels;
++}
++
++static void test_color_analysis_derives_negadoctor_parameters(void **state)
++{
++  (void)state;
++  const size_t width = 160, height = 100;
++  const float base[3] = { 1.0f, 0.62f, 0.31f };
++  float *const pixels = _synthetic_negative(width, height, base);
++  dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_COLOR);
++  config.input_ceiling = 1.0f;
++  dt_film_analysis_result_t result;
++
++  assert_int_equal(dt_film_analyze_rgb_f32(pixels, width, height, width * 3, &config, &result), 0);
++  assert_float_equal(result.film_base[0], base[0], 0.002f);
++  assert_float_equal(result.film_base[1], base[1], 0.002f);
++  assert_float_equal(result.film_base[2], base[2], 0.002f);
++  assert_true(result.negadoctor_dmax > 1.5f);
++  assert_true(result.negadoctor_dmax < 1.9f);
++  assert_true(result.confidence > 0.5f);
++  assert_true(result.warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE);
++
++  const float thin[3] = { base[0], base[1], base[2] };
++  const float dense[3] = { base[0] * 0.02f, base[1] * 0.02f, base[2] * 0.02f };
++  float thin_positive[3], dense_positive[3];
++  dt_film_apply_auto_negadoctor_pixel(thin, &result, thin_positive);
++  dt_film_apply_auto_negadoctor_pixel(dense, &result, dense_positive);
++  assert_true(thin_positive[0] < dense_positive[0]);
++  assert_true(dense_positive[0] > 0.8f);
++  free(pixels);
++}
++
++static void test_monochrome_analysis_preserves_scanner_channel_baselines(void **state)
++{
++  (void)state;
++  const size_t width = 160, height = 100;
++  const float base[3] = { 0.91f, 0.72f, 0.54f };
++  float *const pixels = _synthetic_negative(width, height, base);
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_MONOCHROME);
++  dt_film_analysis_result_t result;
++
++  assert_int_equal(dt_film_analyze_rgb_f32(pixels, width, height, width * 3, &config, &result), 0);
++  assert_float_equal(result.film_base[0], base[0], 0.002f);
++  assert_float_equal(result.film_base[1], base[1], 0.002f);
++  assert_float_equal(result.film_base[2], base[2], 0.002f);
++  assert_false(result.warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE);
++  free(pixels);
++}
++
++static void test_invalid_input_is_rejected(void **state)
++{
++  (void)state;
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_COLOR);
++  dt_film_analysis_result_t result;
++  assert_true(dt_film_analyze_rgb_f32(NULL, 10, 10, 30, &config, &result) < 0);
++  assert_true(dt_film_analyze_rgb_f32((const float[3]){ 1.0f, 1.0f, 1.0f },
++                                      1, 1, 3, &config, &result) < 0);
++}
++
++static void test_rgba_analysis_matches_rgb_and_ignores_alpha(void **state)
++{
++  (void)state;
++  const size_t width = 160, height = 100;
++  const float base[3] = { 0.92f, 0.61f, 0.33f };
++  float *const rgb = _synthetic_negative(width, height, base);
++  float *const rgba = calloc(width * height * 4, sizeof(float));
++  assert_non_null(rgba);
++  for(size_t pixel = 0; pixel < width * height; pixel++)
++  {
++    memcpy(rgba + 4 * pixel, rgb + 3 * pixel, 3 * sizeof(float));
++    rgba[4 * pixel + 3] = pixel % 2 ? -1000.0f : 1000.0f;
++  }
++
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_COLOR);
++  dt_film_analysis_result_t rgb_result, rgba_result;
++  assert_int_equal(dt_film_analyze_rgb_f32(rgb, width, height, width * 3,
++                                            &config, &rgb_result), 0);
++  assert_int_equal(dt_film_analyze_rgba_f32(rgba, width, height, width * 4,
++                                             &config, &rgba_result), 0);
++  assert_memory_equal(rgb_result.film_base, rgba_result.film_base,
++                      sizeof(rgb_result.film_base));
++  assert_float_equal(rgb_result.negadoctor_dmax, rgba_result.negadoctor_dmax, 1.0e-7f);
++  assert_float_equal(rgb_result.negadoctor_offset, rgba_result.negadoctor_offset, 1.0e-7f);
++
++  free(rgba);
++  free(rgb);
++}
++
++static void test_nonuniform_border_is_not_accepted_as_clean_rebate(void **state)
++{
++  (void)state;
++  const size_t width = 160, height = 100;
++  const float base[3] = { 0.92f, 0.61f, 0.33f };
++  float *const pixels = _synthetic_negative(width, height, base);
++  for(size_t y = 0; y < 10; y++)
++    for(size_t x = 0; x < width / 2; x++)
++      for(size_t channel = 0; channel < 3; channel++)
++        pixels[3 * (y * width + x) + channel] *= 0.05f;
++
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_COLOR);
++  dt_film_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_rgb_f32(pixels, width, height, width * 3,
++                                            &config, &result), 0);
++  assert_true(result.warnings & DT_FILM_ANALYSIS_WARNING_NONUNIFORM_REBATE);
++  free(pixels);
++}
++
++static void test_unbounded_working_rgb_above_one_is_not_called_clipped(void **state)
++{
++  (void)state;
++  const size_t width = 160, height = 100;
++  const float base[3] = { 1.20f, 0.82f, 0.48f };
++  float *const pixels = _synthetic_negative(width, height, base);
++  const dt_film_analysis_config_t config = dt_film_analysis_default_config(DT_FILM_STOCK_COLOR);
++  dt_film_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_rgb_f32(pixels, width, height, width * 3,
++                                            &config, &result), 0);
++  assert_false(result.warnings & DT_FILM_ANALYSIS_WARNING_CLIPPED_BASE);
++  assert_float_equal(result.film_base[0], base[0], 0.003f);
++  free(pixels);
++}
++
++int main(void)
++{
++  const struct CMUnitTest tests[] = {
++    cmocka_unit_test(test_color_analysis_derives_negadoctor_parameters),
++    cmocka_unit_test(test_monochrome_analysis_preserves_scanner_channel_baselines),
++    cmocka_unit_test(test_invalid_input_is_rejected),
++    cmocka_unit_test(test_rgba_analysis_matches_rgb_and_ignores_alpha),
++    cmocka_unit_test(test_nonuniform_border_is_not_accepted_as_clean_rebate),
++    cmocka_unit_test(test_unbounded_working_rgb_above_one_is_not_called_clipped),
++  };
++  return cmocka_run_group_tests(tests, NULL, NULL);
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on
+diff --git a/src/tests/unittests/common/test_film_roll_analysis.c b/src/tests/unittests/common/test_film_roll_analysis.c
+new file mode 100644
+index 0000000..e52e506
+--- /dev/null
++++ b/src/tests/unittests/common/test_film_roll_analysis.c
+@@ -0,0 +1,158 @@
++/*
++    This file is part of darktable,
++    Copyright (C) 2026 darktable developers.
++
++    darktable is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++*/
++
++#include <setjmp.h>
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <cmocka.h>
++
++#include "common/film_roll_analysis.h"
++
++static dt_film_analysis_result_t _frame(const float base,
++                                        const float dmax,
++                                        const float confidence,
++                                        const uint32_t warnings)
++{
++  dt_film_analysis_result_t frame;
++  memset(&frame, 0, sizeof(frame));
++  frame.film_base[0] = base;
++  frame.film_base[1] = base * 0.65f;
++  frame.film_base[2] = base * 0.35f;
++  frame.film_base[3] = 1.0f;
++  frame.density_floor[0] = frame.density_floor[1] = frame.density_floor[2] = 0.1f;
++  frame.density_median[0] = frame.density_median[1] = frame.density_median[2] = 0.8f;
++  frame.density_ceiling[0] = frame.density_ceiling[1] = frame.density_ceiling[2] = 1.6f;
++  frame.negadoctor_dmax = dmax;
++  frame.negadoctor_wb_high[0] = frame.negadoctor_wb_high[1]
++    = frame.negadoctor_wb_high[2] = frame.negadoctor_wb_high[3] = 1.0f;
++  frame.confidence = confidence;
++  frame.warnings = warnings;
++  return frame;
++}
++
++static void test_explicit_reference_has_priority(void **state)
++{
++  (void)state;
++  const dt_film_analysis_result_t frames[] = { _frame(0.8f, 1.2f, 0.9f, 0) };
++  const float explicit_base[4] = { 0.95f, 0.62f, 0.33f, 1.0f };
++  dt_film_roll_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_roll(frames, 1, explicit_base, NULL, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_EXPLICIT_REFERENCE);
++  assert_float_equal(result.film_base[0], 0.95f, 1.0e-6f);
++  assert_float_equal(result.base_confidence, 1.0f, 1.0e-6f);
++}
++
++static void test_small_rebate_samples_are_enough(void **state)
++{
++  (void)state;
++  const dt_film_analysis_result_t frames[] = {
++    _frame(0.90f, 1.2f, 0.8f, 0),
++    _frame(0.92f, 1.4f, 0.9f, 0),
++    _frame(0.91f, 1.3f, 0.9f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++  };
++  dt_film_roll_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_roll(frames, 3, NULL, NULL, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_MEASURED_REBATE);
++  assert_float_equal(result.film_base[0], 0.91f, 0.011f);
++  assert_true(result.base_confidence >= 0.8f);
++}
++
++static void test_roll_inference_needs_no_blank_frame(void **state)
++{
++  (void)state;
++  const dt_film_analysis_result_t frames[] = {
++    _frame(0.82f, 1.1f, 0.8f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++    _frame(0.87f, 1.3f, 0.8f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++    _frame(0.91f, 1.2f, 0.9f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++    _frame(0.94f, 1.4f, 0.9f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++  };
++  dt_film_roll_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_roll(frames, 4, NULL, NULL, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_INFERRED_ROLL);
++  assert_true(result.film_base[0] > 0.89f && result.film_base[0] < 0.94f);
++  assert_true(result.warnings & DT_FILM_ROLL_WARNING_BASE_INFERRED);
++}
++
++static void test_prior_and_single_frame_are_explicit_fallbacks(void **state)
++{
++  (void)state;
++  const dt_film_analysis_result_t frame =
++    _frame(0.72f, 1.1f, 0.8f, DT_FILM_ANALYSIS_WARNING_NO_REBATE);
++  const dt_film_base_prior_t prior = { .film_base = { 0.91f, 0.59f, 0.32f, 1.0f },
++                                       .confidence = 0.8f };
++  dt_film_roll_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_roll(&frame, 1, NULL, &prior, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_BORROWED_PRIOR);
++  assert_true(result.warnings & DT_FILM_ROLL_WARNING_BASE_BORROWED);
++
++  assert_int_equal(dt_film_analyze_roll(&frame, 1, NULL, NULL, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_PER_FRAME_FALLBACK);
++  assert_true(result.warnings & DT_FILM_ROLL_WARNING_SINGLE_FRAME);
++}
++
++static void test_single_frame_fallback_skips_rejected_first_frame(void **state)
++{
++  (void)state;
++  const dt_film_analysis_result_t frames[] = {
++    _frame(0.99f, 1.0f, 0.1f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++    _frame(0.72f, 1.1f, 0.8f, DT_FILM_ANALYSIS_WARNING_NO_REBATE),
++  };
++  dt_film_roll_analysis_result_t result;
++  assert_int_equal(dt_film_analyze_roll(frames, 2, NULL, NULL, &result), 0);
++  assert_int_equal(result.base_mode, DT_FILM_BASE_PER_FRAME_FALLBACK);
++  assert_float_equal(result.film_base[0], 0.72f, 1.0e-6f);
++  assert_int_equal(result.frames_rejected, 1);
++}
++
++static void test_roll_baseline_shares_range_but_keeps_frame_luma(void **state)
++{
++  (void)state;
++  dt_film_analysis_result_t frames[] = {
++    _frame(0.90f, 1.5f, 0.9f, 0),
++    _frame(0.92f, 1.5f, 0.9f, 0),
++  };
++  for(size_t channel = 0; channel < 3; channel++)
++  {
++    frames[1].density_floor[channel] += 0.2f;
++    frames[1].density_median[channel] += 0.2f;
++    frames[1].density_ceiling[channel] += 0.2f;
++  }
++  dt_film_roll_analysis_result_t roll;
++  assert_int_equal(dt_film_analyze_roll(frames, 2, NULL, NULL, &roll), 0);
++  dt_film_analysis_result_t light, dark;
++  assert_int_equal(dt_film_apply_roll_baseline(&frames[0], &roll, &light), 0);
++  assert_int_equal(dt_film_apply_roll_baseline(&frames[1], &roll, &dark), 0);
++  for(size_t channel = 0; channel < 3; channel++)
++    assert_float_equal(light.density_ceiling[channel] - light.density_floor[channel],
++                       dark.density_ceiling[channel] - dark.density_floor[channel], 1.0e-6f);
++  assert_true(dark.negadoctor_offset > light.negadoctor_offset);
++}
++
++int main(void)
++{
++  const struct CMUnitTest tests[] = {
++    cmocka_unit_test(test_explicit_reference_has_priority),
++    cmocka_unit_test(test_small_rebate_samples_are_enough),
++    cmocka_unit_test(test_roll_inference_needs_no_blank_frame),
++    cmocka_unit_test(test_prior_and_single_frame_are_explicit_fallbacks),
++    cmocka_unit_test(test_single_frame_fallback_skips_rejected_first_frame),
++    cmocka_unit_test(test_roll_baseline_shares_range_but_keeps_frame_luma),
++  };
++  return cmocka_run_group_tests(tests, NULL, NULL);
++}
++
++// clang-format off
++// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
++// vim: shiftwidth=2 expandtab tabstop=2 cindent
++// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
++// clang-format on

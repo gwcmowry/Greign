@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "crates/greign-app",
+    "crates/greign-gl-preview",
+    "crates/greign-film",
+    "crates/greign-cli",
+    "crates/greign-catalog",
+    "crates/greign-core",
+    "crates/greign-export",
+    "crates/greign-gpu",
+    "crates/greign-pipeline",
+    "crates/greign-raw",
+]
+resolver = "3"
+exclude = ["vendor/rawler"]
+
+[patch.crates-io]
+rawler = { path = "vendor/rawler" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/gwcmowry/Greign"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+clap = { version = "4.5.51", features = ["derive", "env"] }
+greign-core = { path = "crates/greign-core" }
+greign-catalog = { path = "crates/greign-catalog" }
+greign-export = { path = "crates/greign-export" }
+greign-gpu = { path = "crates/greign-gpu" }
+greign-pipeline = { path = "crates/greign-pipeline" }
+greign-raw = { path = "crates/greign-raw" }
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "tiff"] }
+mozjpeg = "0.10.13"
+rawler = "=0.7.0"
+rayon = "1.12.0"
+rusqlite = { version = "0.37.0", features = ["backup", "bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tiff = "0.10.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+wgpu = { version = "26.0.1", default-features = false, features = ["std", "vulkan", "metal", "wgsl"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

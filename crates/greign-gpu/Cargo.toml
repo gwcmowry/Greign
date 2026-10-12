@@ -1,0 +1,19 @@
+[package]
+name = "greign-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU runtime invariants and shaders for Greign"
+
+[dependencies]
+bytemuck.workspace = true
+greign-pipeline.workspace = true
+greign-raw.workspace = true
+pollster = "1.0.1"
+rayon.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

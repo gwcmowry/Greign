@@ -1,0 +1,21 @@
+[package]
+name = "greign-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Color-managed proof export for Greign"
+
+[dependencies]
+greign-pipeline.workspace = true
+image.workspace = true
+mozjpeg.workspace = true
+thiserror.workspace = true
+tiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "greign-film"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+greign-pipeline.workspace = true
+greign-raw.workspace = true
+image.workspace = true
+rayon.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+greign-export.workspace = true

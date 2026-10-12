@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "canon-eos-r7-raw",
+      "url": "https://raw.pixls.us/getfile.php/5633/nice/Canon%20-%20EOS%20R7%20-%203%3A2.CR3",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "sha256": "887439cb1a45becd6a5c85fe75ae10e6c520a9f13a8b9ed077c6cf5d7c37700c",
+      "camera_make": "Canon",
+      "camera_model": "Canon EOS R7",
+      "format": "CR3",
+      "mode": "raw",
+      "width": 7128,
+      "height": 4732,
+      "expected": {
+        "active_area": [144, 72, 6982, 4654],
+        "cfa": "RGGB",
+        "preview_width": 6960,
+        "preview_height": 4640,
+        "mosaic_sha256_le_u16": "321a3e67b3c24e50878f93ae9edfccd5948d21eae38d23f7278db2068c48e15a"
+      }
+    }
+  ]
+}

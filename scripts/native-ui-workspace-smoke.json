@@ -1,0 +1,18 @@
+[
+  {"action":"capture","path":"exports/ui/greign-workspace.png"},
+  {"action":"click","x":1190,"y":158},
+  {"action":"drag","x":1198,"y":390,"to_x":1215,"to_y":390},
+  {"action":"capture","path":"exports/ui/test-roll-adjustment.png"},
+  {"action":"click","x":1285,"y":158},
+  {"action":"drag","x":1198,"y":390,"to_x":1188,"to_y":390},
+  {"action":"capture","path":"exports/ui/test-frame-adjustment.png"},
+  {"action":"click","x":1070,"y":178},
+  {"action":"capture","path":"exports/ui/greign-single-frame.png"},
+  {"action":"click","x":426,"y":242},
+  {"action":"capture","path":"exports/ui/test-rejected.png"},
+  {"action":"click","x":1328,"y":32},
+  {"action":"capture","path":"exports/ui/test-undo.png"},
+  {"action":"click","x":1370,"y":102},
+  {"action":"click","x":660,"y":430},
+  {"action":"capture","path":"exports/ui/greign-dust-correction.png"}
+]

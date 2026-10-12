@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greign.org/schemas/raw-corpus-manifest-v1.json",
+  "title": "Greign RAW corpus manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "entries"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "url",
+        "license",
+        "sha256",
+        "camera_make",
+        "camera_model",
+        "format",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+        "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "license": { "type": "string", "minLength": 1 },
+        "license_url": { "type": "string", "format": "uri" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "camera_make": { "type": "string", "minLength": 1 },
+        "camera_model": { "type": "string", "minLength": 1 },
+        "format": {
+          "type": "string",
+          "enum": ["CR3", "CR2", "NEF", "ARW", "RAF", "RW2", "ORF", "DNG"]
+        },
+        "mode": { "type": "string" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "expected": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "active_area": {
+              "type": "array",
+              "prefixItems": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "integer", "minimum": 0 },
+                { "type": "integer", "minimum": 1 },
+                { "type": "integer", "minimum": 1 }
+              ],
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "cfa": { "type": "string", "minLength": 1 },
+            "preview_width": { "type": "integer", "minimum": 1 },
+            "preview_height": { "type": "integer", "minimum": 1 },
+            "mosaic_sha256_le_u16": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    }
+  }
+}

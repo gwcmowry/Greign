@@ -1,0 +1,5 @@
+fixtures/downloads/
+fixtures/private/
+fixtures/jpg/
+artifacts/
+scripts/__pycache__/

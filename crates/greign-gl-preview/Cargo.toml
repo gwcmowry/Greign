@@ -1,0 +1,24 @@
+[package]
+name = "greign-gl-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated OpenGL native-preview adapter with CPU parity benchmark"
+
+[dependencies]
+egui = "0.31"
+egui_glow = "0.31"
+glow = "0.16"
+bytemuck.workspace = true
+greign-film = { path = "../greign-film" }
+greign-pipeline.workspace = true
+image.workspace = true
+anyhow.workspace = true
+
+# Only this graphics adapter permits audited unsafe OpenGL FFI. The editor,
+# film algorithms and remaining workspace retain unsafe_code = forbid.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"

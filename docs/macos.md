@@ -1,0 +1,52 @@
+# Greign for macOS
+
+Requires macOS 12 Monterey or newer. Download from the private repository's
+[Releases](https://github.com/gwcmowry/Greign/releases) while signed into GitHub.
+
+- **Apple Silicon (M1 or newer):** `Greign-macos-arm64.dmg`
+- **Intel:** `Greign-macos-intel.dmg`
+
+Open the disk image, drag Greign into Applications, then launch it.
+Rust, Homebrew, Python and a source checkout are not needed to run the app.
+ZIP downloads contain the same app if you prefer them.
+
+These initial builds are ad-hoc signed, not Apple Developer ID signed or
+notarized. If macOS blocks the first launch, try opening the app once, then
+use System Settings → Privacy & Security → Open Anyway. Only do this for
+the build downloaded from your own private repository.
+
+Import your scans with the roll import control. The downloaded app opens with
+an empty library; private demo photographs are not distributed.
+Command-Z undoes edits; Command-C/V copies/pastes frame adjustments;
+Command-E opens export. Command-scroll zooms around the pointer.
+
+Your library and edits are saved under
+`~/Library/Application Support/Greign/.greign/rolls.json`; diagnostic timings
+are stored alongside it. Default exports go to `~/Pictures/Greign`.
+Original scans are referenced in place and must remain available.
+Installing a newer app preserves these files.
+
+The editor uses native OpenGL preview with CPU fallback. The separate compute
+CLI uses Metal on macOS. Actual film color accuracy and Lightroom DNG handoff
+still need the validation described in the main README.
+
+## Build from source
+
+Install Rust, Xcode Command Line Tools and CMake, then run:
+
+```sh
+./scripts/build-macos.sh
+```
+
+The build script produces a ZIP and DMG under `dist/`. GitHub Actions builds
+both architectures, runs workspace tests, checks the bundle signature and
+linked libraries, and exercises native preview using generated test images.
+The test images are synthetic; they do not validate real film color.
+
+For a workspace with data stored separately, set `GREIGN_WORKSPACE` to a
+writable folder. This also keeps exports inside that workspace.
+`GREIGN_LIBRARY_PATH` can override the library file; `GREIGN_CPU_PREVIEW=1`
+selects CPU preview for troubleshooting.
+
+The independent darktable modification patch is included in the source
+repository, but is not part of this app.

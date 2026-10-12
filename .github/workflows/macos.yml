@@ -1,0 +1,83 @@
+name: macOS app
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: ./scripts/build-macos.sh '${{ matrix.target }}'
+      - name: Native preview smoke test from packaged app
+        run: python3 scripts/macos-smoke.py "$(cat dist/app-path-${{ matrix.arch }}.txt)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Greign-macos-${{ matrix.arch }}
+          path: |
+            dist/Greign-macos-${{ matrix.arch }}.dmg
+            dist/Greign-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-validation-${{ matrix.arch }}
+          path: artifacts/macos-smoke/
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Greign-macos-*
+          path: dist
+          merge-multiple: true
+      - name: Publish private release downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          Native Greign film workspace for macOS 12 or newer.
+
+          Choose arm64 for Apple Silicon or intel for an Intel Mac. Open the DMG and drag Greign to Applications. No development tools are needed.
+
+          These builds are ad-hoc signed and not notarized. If macOS blocks the first launch, use System Settings → Privacy & Security → Open Anyway after attempting to open the app.
+
+          Libraries persist under ~/Library/Application Support/Greign; default exports go to ~/Pictures/Greign. Private photographs are not included. This is an initial prototype release; real film color validation remains ongoing.
+          EOF
+          gh release create "$TAG" dist/*.dmg dist/*.zip --title "Greign $TAG for macOS" --notes-file /tmp/release-notes.md --prerelease

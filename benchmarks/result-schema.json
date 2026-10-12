@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greign.org/schemas/benchmark-result-v1.json",
+  "title": "Greign benchmark result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "backend",
+    "input",
+    "width",
+    "height",
+    "iterations",
+    "peak_rss_kib",
+    "build_profile"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "backend": { "type": "string" },
+    "input": { "type": "string" },
+    "width": { "type": "integer", "minimum": 1 },
+    "height": { "type": "integer", "minimum": 1 },
+    "iterations": { "type": "integer", "minimum": 1 },
+    "peak_rss_kib": { "type": ["integer", "null"], "minimum": 0 },
+    "build_profile": { "enum": ["debug", "release"] },
+    "metadata_ms": { "$ref": "#/$defs/distribution" },
+    "preview_ms": { "$ref": "#/$defs/distribution" },
+    "mosaic_ms": {
+      "oneOf": [
+        { "$ref": "#/$defs/distribution" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "$defs": {
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["p50", "p95", "min", "max"],
+      "properties": {
+        "p50": { "type": "number", "minimum": 0 },
+        "p95": { "type": "number", "minimum": 0 },
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

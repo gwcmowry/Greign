@@ -1,0 +1,29 @@
+[package]
+name = "greign-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless inspection and rendering commands for Greign"
+
+[[bin]]
+name = "greign"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+greign-core.workspace = true
+greign-export.workspace = true
+greign-gpu.workspace = true
+greign-pipeline.workspace = true
+greign-raw.workspace = true
+image.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

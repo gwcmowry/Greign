@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "color-kodak-gold-snow-nikon-d780",
+      "url": "https://discuss.pixls.us/uploads/short-url/xO6gQcM1ypu8G6OcV9GTznEn1Y8.NEF",
+      "license": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "sha256": "2e2cae59c6b70c695587d8f302c944ea081faaf54b587e40268ce4ddabfddec2",
+      "camera_make": "NIKON CORPORATION",
+      "camera_model": "NIKON D780",
+      "format": "NEF",
+      "mode": "14bit",
+      "width": 6064,
+      "height": 4040,
+      "expected": {
+        "active_area": [0, 0, 6064, 4040],
+        "cfa": "RGGB"
+      }
+    },
+    {
+      "id": "color-aged-negative-canon",
+      "url": "https://discuss.pixls.us/uploads/short-url/qwggfuh9aNKhNT9q39GdGKox9F5.cr2",
+      "license": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "sha256": "56f30d06a9b85de00b99ac092533321502a59c8ffa096c516330e17f56c76749",
+      "camera_make": "Canon",
+      "camera_model": "Canon EOS 80D",
+      "format": "CR2",
+      "width": 6288,
+      "height": 4056,
+      "expected": {
+        "active_area": [264, 34, 6022, 4022],
+        "cfa": "RGGB"
+      }
+    },
+    {
+      "id": "bw-negative-fujifilm-x-t2",
+      "url": "https://discuss.pixls.us/uploads/short-url/bomRX0NGys7yV2UOKwBCjEGGNQ3.raf",
+      "license": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "sha256": "1b523514c424c99350d779a1b88e118b4bbdba03e51834db310aeae6c06e84b0",
+      "camera_make": "FUJIFILM",
+      "camera_model": "X-T2",
+      "format": "RAF",
+      "width": 6048,
+      "height": 4038,
+      "expected": {
+        "active_area": [0, 0, 5920, 4038],
+        "cfa": "x-trans-6x6"
+      }
+    }
+  ]
+}

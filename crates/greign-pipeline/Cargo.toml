@@ -1,0 +1,16 @@
+[package]
+name = "greign-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CPU reference image-processing pipeline for Greign"
+
+[dependencies]
+greign-raw.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true
