@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-greign-film = { path = "../greign-film" }
-greign-gl-preview = { path = "../greign-gl-preview" }
+greign-film = { path = "../greign-film", version = "=0.1.0" }
+greign-gl-preview = { path = "../greign-gl-preview", version = "=0.1.0" }
 greign-pipeline.workspace = true
 greign-export.workspace = true
 serde.workspace = true

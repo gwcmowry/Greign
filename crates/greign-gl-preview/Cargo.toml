@@ -11,7 +11,7 @@ egui = "0.31"
 egui_glow = "0.31"
 glow = "0.16"
 bytemuck.workspace = true
-greign-film = { path = "../greign-film" }
+greign-film = { path = "../greign-film", version = "=0.1.0" }
 greign-pipeline.workspace = true
 image.workspace = true
 anyhow.workspace = true

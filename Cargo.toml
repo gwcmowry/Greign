@@ -28,12 +28,12 @@ repository = "https://github.com/gwcmowry/Greign"
 anyhow = "1.0.100"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4.5.51", features = ["derive", "env"] }
-greign-core = { path = "crates/greign-core" }
-greign-catalog = { path = "crates/greign-catalog" }
-greign-export = { path = "crates/greign-export" }
-greign-gpu = { path = "crates/greign-gpu" }
-greign-pipeline = { path = "crates/greign-pipeline" }
-greign-raw = { path = "crates/greign-raw" }
+greign-core = { path = "crates/greign-core", version = "=0.1.0" }
+greign-catalog = { path = "crates/greign-catalog", version = "=0.1.0" }
+greign-export = { path = "crates/greign-export", version = "=0.1.0" }
+greign-gpu = { path = "crates/greign-gpu", version = "=0.1.0" }
+greign-pipeline = { path = "crates/greign-pipeline", version = "=0.1.0" }
+greign-raw = { path = "crates/greign-raw", version = "=0.1.0" }
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "tiff"] }
 mozjpeg = "0.10.13"
 rawler = "=0.7.0"

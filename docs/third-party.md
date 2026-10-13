@@ -1,5 +1,22 @@
 # Third-party data
 
+## Binary distribution notices
+
+macOS bundles include `ThirdPartyNotices.txt`, generated from dependency
+license files (including nested C codec and font notices), and Greign's GPL
+license. Release source downloads include the complete patched Rawler source.
+The dependency policy accepts the Boost, CC0, NCSA and bundled font licenses,
+and has an explicit exception for the vendored Rawler 0.7.0 LGPL-2.1 license.
+
+## Maintenance notices reviewed for the initial macOS release
+
+The October 2026 audit found no known security vulnerabilities. It reported
+maintenance notices RUSTSEC-2024-0436 (`paste` 1.0.15) and RUSTSEC-2026-0192
+(`ttf-parser` 0.25.1) in the existing dependency graph. These are recorded as
+specific cargo-deny exceptions; security advisories and yanked dependencies
+continue to fail. Cargo-audit still reports the maintenance warnings.
+Revisit both when upgrading the rendering and font dependencies.
+
 ## colord sRGB ICC profile
 
 `greign-export` embeds the standard sRGB profile distributed by the colord

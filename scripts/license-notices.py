@@ -16,7 +16,13 @@ with Path(sys.argv[2]).open("w") as output:
         output.write(f"Source: {package.get('repository') or package.get('source') or 'Greign workspace'}\n")
         root = Path(package["manifest_path"]).parent
         for path in sorted(root.rglob("*")):
-            if path.is_file() and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE", "COPYRIGHT")):
+            name = path.name.upper()
+            is_notice = (
+                any(word in name for word in ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT"))
+                or name in ("OFL.TXT", "UFL.TXT")
+                or (package["name"] == "epaint_default_fonts" and path.suffix.lower() == ".txt")
+            )
+            if path.is_file() and is_notice:
                 output.write(f"\n--- {path.relative_to(root)} ---\n")
                 output.write(path.read_text(errors="replace"))
                 output.write("\n")
