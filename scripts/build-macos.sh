@@ -40,7 +40,7 @@ plutil -lint "$app/Contents/Info.plist"
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
 otool -L "$app/Contents/MacOS/greign-app" > "$stage/linked-libraries.txt"
-if grep -E '/(opt/homebrew|usr/local|Users)/' "$stage/linked-libraries.txt"; then
+if grep -E '^[[:space:]]+/(opt/homebrew|usr/local|Users)/' "$stage/linked-libraries.txt"; then
     echo "App links to a build-machine library; refusing to package." >&2
     exit 1
 fi
