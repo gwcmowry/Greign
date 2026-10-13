@@ -19,9 +19,6 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
             arch: arm64
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            arch: intel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -76,7 +73,7 @@ jobs:
           cat > /tmp/release-notes.md <<'EOF'
           Native Greign film workspace for macOS 12 or newer.
 
-          Choose arm64 for Apple Silicon or intel for an Intel Mac. Open the DMG and drag Greign to Applications. No development tools are needed.
+          Built for Apple Silicon Macs (M1 or newer). Open the DMG and drag Greign to Applications. No development tools are needed.
 
           These builds are ad-hoc signed and not notarized. If macOS blocks the first launch, use System Settings → Privacy & Security → Open Anyway after attempting to open the app.
 

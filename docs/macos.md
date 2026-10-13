@@ -3,8 +3,7 @@
 Requires macOS 12 Monterey or newer. Download from the private repository's
 [Releases](https://github.com/gwcmowry/Greign/releases) while signed into GitHub.
 
-- **Apple Silicon (M1 or newer):** `Greign-macos-arm64.dmg`
-- **Intel:** `Greign-macos-intel.dmg`
+The app download is `Greign-macos-arm64.dmg` for Apple Silicon (M1 or newer).
 
 Open the disk image, drag Greign into Applications, then launch it.
 Rust, Homebrew, Python and a source checkout are not needed to run the app.
@@ -39,7 +38,7 @@ Install Rust, Xcode Command Line Tools and CMake, then run:
 ```
 
 The build script produces a ZIP and DMG under `dist/`. GitHub Actions builds
-both architectures, runs workspace tests, checks the bundle signature and
+Apple Silicon, runs workspace tests, checks the bundle signature and
 linked libraries, and exercises native preview using generated test images.
 The test images are synthetic; they do not validate real film color.
 
