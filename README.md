@@ -21,7 +21,7 @@ it tests Greign's image quality.
 
 ## Requirements
 
-- Rust 1.85 or newer
+- Rust 1.89 or newer
 - The repository pins Rust 1.93.1 for reproducible development and app builds
 - A POSIX shell for the repository check script
 - `cargo-audit` and `cargo-deny` only when running dependency audits locally

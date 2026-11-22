@@ -13,7 +13,7 @@ The binary notice collector includes `YUNET-LICENSE` automatically.
 Tract 0.22.1 (MIT or Apache-2.0) executes the bundled model on the CPU. There are
 no runtime downloads, Python dependency, cloud calls, or image uploads for CPU inference. The
 lockfile pins `psm` 0.1.24 because newer versions pull in an archive writer that
-requires Rust syntax beyond the workspace's declared Rust 1.85 minimum.
+requires Rust syntax beyond the workspace's former Rust 1.85 minimum.
 
 Optional Linux CUDA inference uses `ort` 2.0.0-rc.10 (MIT or Apache-2.0) to load
 ONNX Runtime 1.22.0 (MIT) dynamically. `scripts/setup-upright-gpu.py` installs
