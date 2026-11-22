@@ -316,7 +316,7 @@ fn reduce_bayer(
     sample: impl Fn(u32, u32) -> f32 + Sync,
 ) -> Result<NormalizedMosaic, PipelineError> {
     let mut factor = source_width.max(source_height).div_ceil(max_dimension);
-    if factor % 2 != 0 {
+    if !factor.is_multiple_of(2) {
         factor = factor.saturating_add(1);
     }
     let width = source_width.div_ceil(factor);

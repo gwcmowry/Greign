@@ -411,7 +411,7 @@ fn exclude_perforations(
     side: usize,
 ) -> Edge {
     let span = if side < 2 { h } else { w };
-    let direction = if side % 2 == 0 { 1. } else { -1. };
+    let direction = if side.is_multiple_of(2) { 1. } else { -1. };
     let limit = (w.min(h) as f32 * 0.03).ceil() as usize;
     let clipped: Vec<usize> = (0..=limit)
         .map(|inset| {
@@ -427,15 +427,14 @@ fn exclude_perforations(
                 .count()
         })
         .collect();
-    if let Some(first_bad) = clipped.iter().take(4).position(|n| *n >= 4) {
-        if let Some((inset, _)) = clipped
+    if let Some(first_bad) = clipped.iter().take(4).position(|n| *n >= 4)
+        && let Some((inset, _)) = clipped
             .windows(3)
             .enumerate()
             .skip(first_bad + 1)
             .find(|(_, run)| run.iter().all(|n| *n <= 1))
-        {
-            edge.intercept += direction * inset as f32;
-        }
+    {
+        edge.intercept += direction * inset as f32;
     }
     edge
 }

@@ -10,7 +10,7 @@ conventions, and the complete license are in
 [`crates/greign-film/models`](../crates/greign-film/models/README.md).
 The binary notice collector includes `YUNET-LICENSE` automatically.
 
-Tract 0.22.1 (MIT or Apache-2.0) executes the bundled model on the CPU. There are
+Tract 0.22.2 (MIT or Apache-2.0) executes the bundled model on the CPU. There are
 no runtime downloads, Python dependency, cloud calls, or image uploads for CPU inference. The
 lockfile pins `psm` 0.1.24 because newer versions pull in an archive writer that
 requires Rust syntax beyond the workspace's former Rust 1.85 minimum.

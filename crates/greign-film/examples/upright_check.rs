@@ -90,11 +90,12 @@ fn main() -> Result<()> {
                         "Orientation mismatch {name}, input turn {turn}, mirrored {mirrored}: {guess:?}, expected {expected:?}"
                     );
                 }
-                if turn == 0 && !mirrored {
-                    if let Some(correction) = guess.rotation {
-                        let upright = oriented(&image, correction);
-                        upright.save(output.join(format!("{name}-upright.jpg")))?;
-                    }
+                if turn == 0
+                    && !mirrored
+                    && let Some(correction) = guess.rotation
+                {
+                    let upright = oriented(&image, correction);
+                    upright.save(output.join(format!("{name}-upright.jpg")))?;
                 }
                 checked += 1;
             }

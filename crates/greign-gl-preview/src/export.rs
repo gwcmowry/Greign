@@ -208,7 +208,11 @@ fn dimensions(width: u32, height: u32, crop: Rect, rotation: u8) -> Result<(u32,
     ensure!(x < width && y < height, "Export crop has no source pixels");
     let w = ((crop.w * width as f32) as u32).max(1).min(width - x);
     let h = ((crop.h * height as f32) as u32).max(1).min(height - y);
-    Ok(if rotation % 2 == 0 { (w, h) } else { (h, w) })
+    Ok(if rotation.is_multiple_of(2) {
+        (w, h)
+    } else {
+        (h, w)
+    })
 }
 
 #[cfg(test)]
