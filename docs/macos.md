@@ -31,7 +31,24 @@ still need the validation described in the main README.
 
 ## Build from source
 
-Install Rust, Xcode Command Line Tools and CMake, then run:
+For a first build, install the Xcode Command Line Tools with `xcode-select --install`
+and let the installer finish. If you use Homebrew, install Rust via rustup and
+install CMake with `brew install rustup cmake`. If this is your first rustup
+installation, run `rustup default stable`. The checkout pins the compiler it uses.
+
+Clone the private repository using a GitHub account with access, then build and
+launch the editor from Terminal.
+
+```sh
+git clone https://github.com/gwcmowry/Greign.git
+cd Greign
+cargo run --release --locked -p greign-app
+```
+
+For an existing checkout, run `git switch main` and `git pull --ff-only` in
+the repository, then repeat the Cargo command above.
+
+To make a Finder-launchable app and disk image from the same checkout, run
 
 ```sh
 ./scripts/build-macos.sh
