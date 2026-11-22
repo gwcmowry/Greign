@@ -208,18 +208,23 @@ mirroring for the roll. Each change is one Undo step.
 
 **Auto upright**, in the same toolbar, checks converted positive previews using
 a bundled face-and-landmark model. It compares 0°, 90°, 180°, and 270° and sets
-quarter-turn rotation only when a strong face detection clearly wins. It runs
-locally, with no image upload or paid service. CPU inference uses up to four
-workers (about 0.11 seconds per picture on the validation workstation).
+quarter-turn rotation when the face evidence clearly favors one view. For a
+weaker match, it checks whether the same face is detectable after mirroring.
+Unresolved frames get a second check at a smaller scale for close-up faces.
+If two distinct faces each favor the same turn at both scales, Greign can use
+their agreement to settle a tie. When two leading turns disagree about one
+face, Greign checks that face in a crop from the original preview.
+A bundled scene classifier checks remaining frames. Each of four rotated views must
+predict the same source correction with a softmax score of at least 0.90. Both
+models run locally.
 An optional NVIDIA CUDA backend is available on Linux; the completion message
 and timing log identify **CUDA**, **CPU**, or **CPU fallback**. GPU initialization
 and inference failures fall back to the CPU path.
-Analyze negative scans first. Photos with no clear face or ambiguous evidence
+Analyze negative scans first. Photos with unresolved orientation
 keep their rotation and receive **Needs my review**. Existing review flags are
 preserved. The entire operation, including new review flags, is one Undo step;
 crop, fine straightening, mirroring, and accepted calibration are preserved.
-This is a people-based aid: landscapes and reclining or obscured people may
-need manual rotation. A suggested rotation can always be adjusted manually.
+A suggested rotation can always be adjusted manually.
 
 Install the optional GPU runtime once from the repository:
 

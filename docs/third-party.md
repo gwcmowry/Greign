@@ -8,7 +8,9 @@ quarter-turn orientation, with abstention when the orientation is uncertain.
 The weights are MIT licensed, copyright 2020 Shiqi Yu. Source, checksum, input
 conventions, and the complete license are in
 [`crates/greign-film/models`](../crates/greign-film/models/README.md).
-The binary notice collector includes `YUNET-LICENSE` automatically.
+Greign also embeds Duarte Barbosa’s EfficientNetV2 scene-orientation weights
+(MIT, copyright 2025 Duarte Barbosa). The binary notice collector includes
+`YUNET-LICENSE` and `SCENE-LICENSE`.
 
 Tract 0.22.2 (MIT or Apache-2.0) executes the bundled model on the CPU. There are
 no runtime downloads, Python dependency, cloud calls, or image uploads for CPU inference. The

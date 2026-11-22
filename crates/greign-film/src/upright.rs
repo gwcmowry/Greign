@@ -136,16 +136,156 @@ impl UprightDetector {
             (image.height() as f32 * scale).round().max(1.) as u32,
             imageops::FilterType::Triangle,
         );
-        let mut views: [Vec<Face>; 4] = std::array::from_fn(|_| Vec::new());
-        let evaluate = |turn: usize| -> Result<Vec<Face>> {
-            let rotated = match turn {
-                1 => imageops::rotate90(&small),
-                2 => imageops::rotate180(&small),
-                3 => imageops::rotate270(&small),
-                _ => small.clone(),
-            };
-            self.faces(&rotated)
+        let views = self.views(&small)?;
+        let mut guess = decide(&views);
+        if guess.rotation.is_none() {
+            // A marginal face needs both a clear lead and a repeat detection at
+            // the same location after reflection. Never break close ties this way.
+            for (turn, candidates) in views.iter().enumerate() {
+                let Some(face) = candidates.first() else {
+                    continue;
+                };
+                if face.confidence < 0.85
+                    || guess
+                        .scores
+                        .iter()
+                        .enumerate()
+                        .any(|(other, score)| other != turn && guess.scores[turn] - score < 0.15)
+                {
+                    continue;
+                }
+                let reflected = imageops::flip_horizontal(&quarter_turn(&small, turn));
+                let [x, y, w, h] = face.bounds;
+                let expected = [reflected.width() as f32 - x - w, y, w, h];
+                if self
+                    .faces(&reflected)?
+                    .iter()
+                    .any(|f| f.confidence >= 0.85 && overlap(expected, f.bounds) >= 0.5)
+                {
+                    guess.rotation = Some(turn as u8);
+                    guess.reason = "Face orientation confirmed in mirrored view".into();
+                }
+                break;
+            }
+        }
+        if guess.rotation.is_none() {
+            // Large close-up faces sometimes produce better landmarks at a
+            // smaller scale. Check all four views so alternatives still compete.
+            let compact = imageops::resize(
+                &small,
+                (small.width() / 2).max(1),
+                (small.height() / 2).max(1),
+                imageops::FilterType::Triangle,
+            );
+            let mut compact_views = self.views(&compact)?;
+            let retry = decide(&compact_views);
+            if let Some(turn) = retry.rotation {
+                let index = usize::from(turn);
+                let conflicting = guess.scores.iter().enumerate().any(|(other, &score)| {
+                    other != index && score >= 0.85 && score > guess.scores[index]
+                });
+                if !conflicting {
+                    return Ok(UprightGuess {
+                        reason: "Clear face orientation at smaller scale".into(),
+                        ..retry
+                    });
+                }
+            }
+            let mut full_views = views;
+            source_boxes(&mut full_views, small.dimensions());
+            source_boxes(&mut compact_views, compact.dimensions());
+            let mut ranking = [0, 1, 2, 3];
+            ranking.sort_by(|&a, &b| guess.scores[b].total_cmp(&guess.scores[a]));
+            let [best, second, ..] = ranking;
+            if agrees_on_two_faces(&full_views, &compact_views, best) {
+                guess.rotation = Some(best as u8);
+                guess.reason = "Two faces agree across scales".into();
+            } else if let ([first], [rival]) = (&full_views[best][..], &full_views[second][..])
+                && rival.confidence >= 0.75
+                && first.confidence - rival.confidence < 0.15
+                && overlap(first.bounds, rival.bounds) >= 0.45
+                && let Some(verified) =
+                    self.verify_face_crop(image, first.bounds, [best, second])?
+            {
+                return Ok(verified);
+            }
+        }
+        if guess.rotation.is_none() {
+            guess.rotation = match &self.engine {
+                Engine::Cpu { workers, .. } => crate::scene_upright::verify(
+                    image,
+                    Some(workers),
+                    crate::scene_upright::cpu_logits,
+                ),
+                #[cfg(target_os = "linux")]
+                Engine::Cuda(model) => {
+                    crate::scene_upright::verify(image, None, |input| model.scene_logits(input))
+                }
+            }?;
+            if guess.rotation.is_some() {
+                guess.reason = "Whole scene agrees in all four orientations".into();
+            }
+        }
+        Ok(guess)
+    }
+
+    fn verify_face_crop(
+        &self,
+        image: &RgbImage,
+        bounds: [f32; 4],
+        contenders: [usize; 2],
+    ) -> Result<Option<UprightGuess>> {
+        // Keep context around the face and take pixels from the original input,
+        // before the 640px pass. Missing context at an image edge is clipped.
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        let [x, y, w, h] = bounds;
+        let half = (w * width).max(h * height);
+        let cx = (x + w * 0.5) * width;
+        let cy = (y + h * 0.5) * height;
+        let left = (cx - half).floor().clamp(0., width - 1.) as u32;
+        let top = (cy - half).floor().clamp(0., height - 1.) as u32;
+        let cw = (cx + half).ceil().clamp(left as f32 + 1., width) as u32 - left;
+        let ch = (cy + half).ceil().clamp(top as f32 + 1., height) as u32 - top;
+        let crop = imageops::crop_imm(image, left, top, cw, ch).to_image();
+        let crop = if cw.max(ch) > SIZE as u32 {
+            let scale = SIZE as f32 / cw.max(ch) as f32;
+            imageops::resize(
+                &crop,
+                ((cw as f32 * scale).round() as u32).max(1),
+                ((ch as f32 * scale).round() as u32).max(1),
+                imageops::FilterType::Triangle,
+            )
+        } else {
+            crop
         };
+        let expected = [
+            (x * width - left as f32) / cw as f32,
+            (y * height - top as f32) / ch as f32,
+            w * width / cw as f32,
+            h * height / ch as f32,
+        ];
+        let mut views = self.views(&crop)?;
+        source_boxes(&mut views, crop.dimensions());
+        // Verify the disputed face itself, even if a second person enters the crop.
+        for view in &mut views {
+            view.retain(|f| overlap(f.bounds, expected) >= 0.45);
+            view.truncate(1);
+        }
+        let mut verified = decide(&views);
+        if verified
+            .rotation
+            .is_some_and(|t| contenders.contains(&usize::from(t)))
+        {
+            verified.reason = "Face orientation confirmed in source crop".into();
+            Ok(Some(verified))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn views(&self, image: &RgbImage) -> Result<[Vec<Face>; 4]> {
+        let mut views: [Vec<Face>; 4] = std::array::from_fn(|_| Vec::new());
+        let evaluate = |turn| self.faces(&quarter_turn(image, turn));
         match &self.engine {
             Engine::Cpu { workers, .. } => workers.install(|| {
                 views
@@ -163,7 +303,7 @@ impl UprightDetector {
                 }
             }
         }
-        Ok(decide(&views))
+        Ok(views)
     }
 
     fn faces(&self, image: &RgbImage) -> Result<Vec<Face>> {
@@ -192,6 +332,15 @@ impl UprightDetector {
                 decode(&slices, image)
             }
         }
+    }
+}
+
+fn quarter_turn(image: &RgbImage, turn: usize) -> RgbImage {
+    match turn {
+        1 => imageops::rotate90(image),
+        2 => imageops::rotate180(image),
+        3 => imageops::rotate270(image),
+        _ => image.clone(),
     }
 }
 
@@ -276,6 +425,74 @@ fn overlap(a: [f32; 4], b: [f32; 4]) -> f32 {
     intersection / (a[2] * a[3] + b[2] * b[3] - intersection).max(0.0001)
 }
 
+// Map each rotated view into normalized coordinates of the unrotated image.
+fn source_boxes(views: &mut [Vec<Face>; 4], (width, height): (u32, u32)) {
+    for (turn, faces) in views.iter_mut().enumerate() {
+        for face in faces {
+            let [x, y, w, h] = face.bounds;
+            let (width, height) = (width as f32, height as f32);
+            let [x, y, w, h] = match turn {
+                1 => [y, height - x - w, h, w],
+                2 => [width - x - w, height - y - h, w, h],
+                3 => [width - y - h, x, h, w],
+                _ => [x, y, w, h],
+            };
+            face.bounds = [x / width, y / height, w / width, h / height];
+        }
+    }
+}
+
+fn agrees_on_two_faces(full: &[Vec<Face>; 4], compact: &[Vec<Face>; 4], turn: usize) -> bool {
+    // A person must favor the same turn over their own alternate detections at
+    // both scales. Two tracks must use distinct boxes in both views.
+    let favors = |face: &Face, views: &[Vec<Face>; 4]| {
+        face.confidence >= 0.85
+            && views
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != turn)
+                .flat_map(|(_, faces)| faces)
+                .filter(|other| overlap(face.bounds, other.bounds) >= 0.4)
+                .all(|other| face.confidence - other.confidence >= 0.025)
+    };
+    if full[turn].len() < 2
+        || compact[turn].len() < 2
+        || compact.iter().enumerate().any(|(other, v)| {
+            other != turn
+                && v.first()
+                    .is_some_and(|f| f.confidence > compact[turn][0].confidence)
+        })
+    {
+        return false;
+    }
+    let mut first_match = None;
+    for face in &full[turn] {
+        if !favors(face, full) {
+            continue;
+        }
+        let Some(partner) = compact[turn]
+            .iter()
+            .filter(|other| overlap(face.bounds, other.bounds) >= 0.5)
+            .max_by(|a, b| {
+                overlap(face.bounds, a.bounds).total_cmp(&overlap(face.bounds, b.bounds))
+            })
+        else {
+            continue;
+        };
+        if !favors(partner, compact) {
+            continue;
+        }
+        if let Some((first, small)) = first_match {
+            if overlap(face.bounds, first) < 0.2 && overlap(partner.bounds, small) < 0.2 {
+                return true;
+            }
+        } else {
+            first_match = Some((face.bounds, partner.bounds));
+        }
+    }
+    false
+}
+
 fn plausible(face: &Face) -> bool {
     let [right_eye, left_eye, nose, right_mouth, left_mouth] = face.landmarks;
     let eyes = [
@@ -336,6 +553,46 @@ mod tests {
             confidence,
         }
     }
+    #[test]
+    fn rectangular_views_map_back_to_the_same_face() {
+        let boxes = [
+            [20., 10., 40., 30.],
+            [60., 20., 30., 40.],
+            [140., 60., 40., 30.],
+            [10., 140., 30., 40.],
+        ];
+        let mut views = boxes.map(|bounds| {
+            vec![Face {
+                bounds,
+                ..face(0.9)
+            }]
+        });
+        source_boxes(&mut views, (200, 100));
+        for view in views {
+            assert!(overlap(view[0].bounds, [0.1, 0.1, 0.2, 0.3]) > 0.999);
+        }
+    }
+
+    #[test]
+    fn matching_needs_two_distinct_faces_that_agree_at_both_scales() {
+        let first = Face {
+            bounds: [0.1, 0.1, 0.3, 0.3],
+            ..face(0.92)
+        };
+        let second = Face {
+            bounds: [0.5, 0.2, 0.3, 0.3],
+            ..face(0.91)
+        };
+        let views = [vec![first.clone(), second], vec![], vec![], vec![]];
+        assert!(agrees_on_two_faces(&views, &views, 0));
+        let mut retry = views.clone();
+        retry[2].push(first.clone());
+        assert!(!agrees_on_two_faces(&views, &retry, 0));
+        retry[2].clear();
+        retry[0][1] = first;
+        assert!(!agrees_on_two_faces(&views, &retry, 0));
+    }
+
     #[test]
     fn unclear_and_conflicting_evidence_does_not_rotate() {
         assert!(

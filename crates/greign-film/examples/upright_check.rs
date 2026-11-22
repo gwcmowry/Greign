@@ -51,13 +51,8 @@ fn main() -> Result<()> {
     for path in paths {
         let name = path.file_stem().unwrap().to_string_lossy();
         let image = image::open(&path)?.to_rgb8();
-        let expected = if name.starts_with("IMG_0011") {
-            None
-        } else if name.starts_with("IMG_0008") {
-            Some(1_u8)
-        } else {
-            Some(0)
-        };
+        // IMG_0011 is an upright skyline and can be resolved by the scene model.
+        let base = u8::from(name.starts_with("IMG_0008"));
         for turn in 0..4_u8 {
             let rotated = oriented(&image, turn);
             for mirrored in [false, true] {
@@ -68,13 +63,11 @@ fn main() -> Result<()> {
                 };
                 let start = Instant::now();
                 let guess = detector.detect(&variant)?;
-                let expected = expected.map(|base| {
-                    if mirrored {
-                        (turn + 4 - base) % 4
-                    } else {
-                        (base + 4 - turn) % 4
-                    }
-                });
+                let expected = if mirrored {
+                    (turn + 4 - base) % 4
+                } else {
+                    (base + 4 - turn) % 4
+                };
                 writeln!(
                     log,
                     "{}",
@@ -84,9 +77,7 @@ fn main() -> Result<()> {
                 decided += usize::from(guess.rotation.is_some());
                 if verify_portra {
                     ensure!(
-                        guess
-                            .rotation
-                            .is_none_or(|rotation| Some(rotation) == expected),
+                        guess.rotation.is_none_or(|rotation| rotation == expected),
                         "Orientation mismatch {name}, input turn {turn}, mirrored {mirrored}: {guess:?}, expected {expected:?}"
                     );
                 }

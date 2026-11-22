@@ -15,6 +15,7 @@ use std::path::Path;
 mod adjustments;
 mod calibration;
 mod crop;
+mod scene_upright;
 mod upright;
 #[cfg(target_os = "linux")]
 mod upright_cuda;

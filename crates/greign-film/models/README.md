@@ -28,3 +28,15 @@ and orientation scores are evaluated. Confidence scores are not probabilities
 that a rotation is correct. Partial/tilted/reclining people and non-human faces
 can be ambiguous, so a strong detection and a margin over competing quarter
 turns are both required.
+
+## Whole-scene fallback
+
+The bundled EfficientNetV2 classifier is MIT licensed. Its input is a 416 × 416
+bilinear RGB resize, center-cropped to 384 × 384 with ImageNet normalization.
+The four logits encode clockwise corrections in quarter turns. Greign accepts
+an unresolved frame only when all four views agree at a softmax score of 0.90
+or higher. The CPU and CUDA paths load these weights on first use.
+
+[Model and weights](https://huggingface.co/DuarteBarbosa/deep-image-orientation-detection/blob/main/orientation_model_v2_0.9882.onnx) · [License](SCENE-LICENSE)
+
+SHA-256: `cffe911c1dff47fbfbbd90110aaab9c07134645c460d35b3ae8832079bea91ba`.

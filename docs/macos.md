@@ -1,18 +1,12 @@
 # Greign for macOS
 
-Requires macOS 12 Monterey or newer. Download from the private repository's
-[Releases](https://github.com/gwcmowry/Greign/releases) while signed into GitHub.
+On an Apple Silicon Mac (M1 or newer) running macOS 12 or later:
 
-The app download is `Greign-macos-arm64.dmg` for Apple Silicon (M1 or newer).
+1. Sign in to a GitHub account with access to Greign and [download Greign-macos-arm64.dmg](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-macos.2/Greign-macos-arm64.dmg).
+2. Open the disk image and drag Greign into Applications.
+3. Open Greign from Applications. If Gatekeeper blocks the first launch, open System Settings → Privacy & Security (System Preferences → Security & Privacy on Monterey), choose **Open Anyway** for Greign and confirm. The beta is ad-hoc signed and has not been notarized.
 
-Open the disk image, drag Greign into Applications, then launch it.
-Rust, Homebrew, Python and a source checkout are not needed to run the app.
-ZIP downloads contain the same app if you prefer them.
-
-These initial builds are ad-hoc signed, not Apple Developer ID signed or
-notarized. If macOS blocks the first launch, try opening the app once, then
-use System Settings → Privacy & Security → Open Anyway. Only do this for
-the build downloaded from your own private repository.
+Both orientation models are bundled and run on the CPU. The DMG includes everything needed to run the editor. A ZIP of the same app is available on the [release page](https://github.com/gwcmowry/Greign/releases/tag/v0.1.0-macos.2).
 
 Import your scans with the roll import control. The downloaded app opens with
 an empty library; private demo photographs are not distributed.

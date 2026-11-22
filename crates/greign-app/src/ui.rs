@@ -328,7 +328,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     if ui.button("Autocrop all frames").on_hover_text("Crop each picture inside its film base and straighten slight tilt. Uncertain frames keep their current crops. Undo restores the entire batch.").clicked() {
                         app.actions.push(Action::AutoCropAll);
                     }
-                    if ui.add_enabled(r.material == Material::Positive || r.analysis.is_some(), egui::Button::new("Auto upright")).on_hover_text("Use a local face model to find upright people in converted photos. Clear matches get quarter-turn rotations; uncertain frames keep their orientation and are marked for review. Apply a conversion first. Undo restores the whole batch.").clicked() {
+                    if ui.add_enabled(r.material == Material::Positive || r.analysis.is_some(), egui::Button::new("Auto upright")).on_hover_text("Check faces and the whole scene locally. Apply confident quarter turns and mark uncertain frames for review. Apply a conversion first. Undo restores the whole batch.").clicked() {
                         app.actions.push(Action::AutoUpright);
                     }
                     let mirrored_count = r.frames.iter().filter(|f| f.mirrored).count();

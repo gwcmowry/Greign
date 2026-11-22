@@ -4,7 +4,10 @@ Greign is a Linux-first, GPU-accelerated, non-destructive RAW developer and
 photographic library. Its defining workflow is fast, roll-aware conversion of
 camera-scanned film negatives.
 
-For Mac installation and downloads, see [Greign for macOS](docs/macos.md).
+**Apple Silicon Mac (M1 or newer), macOS 12 or later:** [Download the Mac beta (.dmg)](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-macos.2/Greign-macos-arm64.dmg).
+Open the disk image, drag Greign to Applications, then open Greign and import a folder of scans.
+Both Auto Upright models are included and run locally. Sign in to a GitHub account with repository access to download the private beta.
+See [first-launch help and installation details](docs/macos.md).
 
 The project is under active, gate-driven development. See [PLAN.md](PLAN.md)
 for the product scope, architecture, performance contract, and ordered exit
@@ -71,8 +74,8 @@ Select contact-sheet frames and press **R** to rotate them clockwise, or
 **Shift+R** to rotate counterclockwise. Each press is one Undo step. **X**
 toggles keep/reject.
 
-**Auto upright** uses a bundled local face model to suggest quarter-turn
-rotations for people photos. Clear matches are applied; uncertain frames keep
+**Auto upright** uses local face and whole-scene models to suggest quarter-turn
+rotations. Clear matches are applied and uncertain frames keep
 their orientation and are marked for review. It supports local CPU inference
 and an optional Linux NVIDIA CUDA backend, with automatic CPU fallback and
 batch Undo. See the [setup and controls guide](docs/native-workflow.md).
