@@ -823,7 +823,8 @@ mod tests {
         );
         let mut checked = false;
         loop {
-            match rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap() {
+            // Debug builds run four full CPU inference passes on shared CI runners.
+            match rx.recv_timeout(Duration::from_secs(120)).unwrap() {
                 Event::AutoOriented(_, result) => {
                     let batch = result.unwrap();
                     assert_eq!(batch.backend, "CPU fallback");
