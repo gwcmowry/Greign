@@ -2901,11 +2901,12 @@ mod tests {
         app.library.rolls.push(roll);
         app.apply_action(Action::AutoCropAll, &ctx);
         assert!(app.busy && app.grid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while app.busy {
             app.drain(&ctx);
             if app.busy {
-                let event = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                app.tx.send(event).unwrap();
+                assert!(std::time::Instant::now() < deadline, "{}", app.status);
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
         let after: Vec<_> = app.library.rolls[0].frames.iter().map(|f| f.crop).collect();
