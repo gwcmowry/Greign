@@ -1,7 +1,8 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use greign_film::{Adjustments, Analysis, Heal, Material, Rect};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -14,8 +15,13 @@ pub struct Frame {
     pub name: String,
     pub rejected: bool,
     pub adjustments: Adjustments,
+    /// Explicit film-base measurement for this frame in individual mode.
+    #[serde(default)]
+    pub base: Option<[f32; 3]>,
     pub crop: Rect,
     pub rotation: u8,
+    #[serde(default)]
+    pub mirrored: bool,
     pub heals: Vec<Heal>,
     pub error: Option<String>,
     #[serde(default)]
@@ -27,6 +33,8 @@ pub struct Frame {
 pub struct Roll {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub source_folder: Option<PathBuf>,
     pub stock: String,
     pub material: Material,
     pub film_camera: String,
@@ -35,8 +43,12 @@ pub struct Roll {
     pub demo: bool,
     pub frames: Vec<Frame>,
     pub adjustments: Adjustments,
-    pub analysis: Option<Analysis>,
-    pub previous_analysis: Option<Analysis>,
+    pub analysis: Option<Conversion>,
+    pub previous_analysis: Option<Conversion>,
+    #[serde(default)]
+    pub optimize_individually: bool,
+    #[serde(default)]
+    pub calibration: greign_film::CalibrationOptions,
     pub base: Option<[f32; 3]>,
     pub analysis_area: Rect,
     #[serde(default)]
@@ -60,11 +72,241 @@ pub struct SavedVersion {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RollState {
     pub adjustments: Adjustments,
-    pub analysis: Option<Analysis>,
+    pub analysis: Option<Conversion>,
+    #[serde(default)]
+    pub optimize_individually: bool,
+    #[serde(default)]
+    pub calibration: greign_film::CalibrationOptions,
     pub base: Option<[f32; 3]>,
     pub analysis_area: Rect,
     pub conversion_locked: bool,
     pub frames: Vec<Frame>,
+}
+
+/// Inputs captured when a conversion is built, for detecting stale proposals.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisInputs {
+    pub base: Option<[f32; 3]>,
+    pub area: Rect,
+    pub frames: BTreeSet<String>,
+    #[serde(default)]
+    pub frame_bases: BTreeMap<String, [f32; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrameAnalysisInputs {
+    pub base: Option<[f32; 3]>,
+    pub area: Rect,
+}
+
+#[derive(Clone)]
+pub struct ProposedConversion {
+    pub roll_id: String,
+    pub conversion: Conversion,
+    /// None replaces the whole roll; Some replaces only this frame.
+    pub frame_id: Option<String>,
+}
+impl ProposedConversion {
+    pub fn affects(&self, roll: &Roll, frame: &Frame) -> bool {
+        self.roll_id == roll.id && self.frame_id.as_ref().is_none_or(|id| *id == frame.id)
+    }
+}
+
+/// Accepted or proposed calibration; old shared-analysis JSON still loads.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Conversion {
+    #[serde(flatten)]
+    pub shared: Analysis,
+    #[serde(default)]
+    pub individual: bool,
+    #[serde(default)]
+    pub per_frame: BTreeMap<String, Analysis>,
+    /// Captured inputs distinguish a pending result from subsequently edited settings.
+    #[serde(default)]
+    pub inputs: Option<AnalysisInputs>,
+    #[serde(default)]
+    pub frame_inputs: BTreeMap<String, FrameAnalysisInputs>,
+}
+impl From<Analysis> for Conversion {
+    fn from(shared: Analysis) -> Self {
+        Self {
+            shared,
+            individual: false,
+            per_frame: BTreeMap::new(),
+            inputs: None,
+            frame_inputs: BTreeMap::new(),
+        }
+    }
+}
+impl Conversion {
+    pub fn analyze(
+        scans: &[(&str, &greign_film::Scan)],
+        individual: bool,
+        base: Option<[f32; 3]>,
+        area: Rect,
+        options: greign_film::CalibrationOptions,
+        frame_bases: &BTreeMap<String, [f32; 3]>,
+    ) -> Result<Self> {
+        ensure!(!scans.is_empty(), "Import some frames first");
+        let inputs = Some(AnalysisInputs {
+            base: if individual { None } else { base },
+            area,
+            frames: scans.iter().map(|(id, _)| (*id).to_owned()).collect(),
+            frame_bases: if individual {
+                frame_bases.clone()
+            } else {
+                BTreeMap::new()
+            },
+        });
+        if !individual {
+            let refs: Vec<_> = scans.iter().map(|(_, scan)| *scan).collect();
+            let mut conversion = Self::from(greign_film::analyze_with_options(
+                &refs, base, area, options,
+            )?);
+            conversion.inputs = inputs;
+            return Ok(conversion);
+        }
+        let mut per_frame = BTreeMap::new();
+        let mut frame_inputs = BTreeMap::new();
+        for (id, scan) in scans {
+            let base = frame_bases.get(*id).copied();
+            let analysis = greign_film::analyze_with_options(&[scan], base, area, options)
+                .with_context(|| format!("Could not optimize frame {id}"))?;
+            per_frame.insert((*id).to_owned(), analysis);
+            frame_inputs.insert((*id).to_owned(), FrameAnalysisInputs { base, area });
+        }
+        let mut shared = per_frame.values().next().unwrap().clone();
+        shared.method = "Frames optimized individually".into();
+        shared.frames = per_frame.len();
+        shared.warnings = per_frame
+            .values()
+            .flat_map(|a| a.warnings.iter().cloned())
+            .collect();
+        shared.warnings.sort();
+        shared.warnings.dedup();
+        Ok(Self {
+            shared,
+            individual: true,
+            per_frame,
+            inputs,
+            frame_inputs,
+        })
+    }
+    pub fn frame_input(&self, id: &str) -> Option<FrameAnalysisInputs> {
+        if !self.frame_inputs.is_empty() {
+            return self.frame_inputs.get(id).cloned();
+        }
+        self.inputs.as_ref().map(|i| FrameAnalysisInputs {
+            base: if self.individual {
+                i.frame_bases.get(id).copied()
+            } else {
+                i.base
+            },
+            area: i.area,
+        })
+    }
+    /// Rebuild one frame while retaining every other accepted calibration.
+    pub fn analyze_frame(roll: &Roll, id: &str, scan: &greign_film::Scan) -> Result<Self> {
+        ensure!(
+            roll.optimize_individually,
+            "Select individual optimization for a frame override"
+        );
+        let frame = roll
+            .frames
+            .iter()
+            .find(|f| f.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Frame no longer exists"))?;
+        let a = greign_film::analyze_with_options(
+            &[scan],
+            frame.base,
+            roll.analysis_area,
+            roll.calibration,
+        )?;
+        let mut next = Self::from(a.clone());
+        next.individual = true;
+        if let Some(previous) = &roll.analysis {
+            for f in &roll.frames {
+                if let Some(old) = previous.for_frame(&f.id) {
+                    next.per_frame.insert(f.id.clone(), old.clone());
+                }
+                if let Some(input) = previous.frame_input(&f.id) {
+                    next.frame_inputs.insert(f.id.clone(), input);
+                }
+            }
+        }
+        next.per_frame.insert(id.to_owned(), a);
+        next.frame_inputs.insert(
+            id.to_owned(),
+            FrameAnalysisInputs {
+                base: frame.base,
+                area: roll.analysis_area,
+            },
+        );
+        next.inputs = Some(roll.analysis_inputs());
+        next.shared.method = "Frames optimized individually".into();
+        next.shared.frames = next.per_frame.len();
+        next.shared.warnings = next
+            .per_frame
+            .values()
+            .flat_map(|a| a.warnings.iter().cloned())
+            .collect();
+        next.shared.warnings.sort();
+        next.shared.warnings.dedup();
+        Ok(next)
+    }
+    pub fn matches_settings(&self, roll: &Roll) -> bool {
+        if self.individual && !self.frame_inputs.is_empty() {
+            return roll.optimize_individually
+                && roll.frames.iter().filter(|f| !f.rejected).all(|f| {
+                    self.per_frame
+                        .get(&f.id)
+                        .is_some_and(|a| a.options == roll.calibration)
+                        && self.frame_inputs.get(&f.id).is_none_or(|i| {
+                            *i == FrameAnalysisInputs {
+                                base: f.base,
+                                area: roll.analysis_area,
+                            }
+                        })
+                });
+        }
+        self.request_matches(roll)
+    }
+    fn request_matches(&self, roll: &Roll) -> bool {
+        self.individual == roll.optimize_individually
+            && self.shared.options == roll.calibration
+            && self.inputs.as_ref().is_none_or(|inputs| {
+                *inputs
+                    == AnalysisInputs {
+                        base: if roll.optimize_individually {
+                            None
+                        } else {
+                            roll.base
+                        },
+                        area: roll.analysis_area,
+                        frames: roll
+                            .frames
+                            .iter()
+                            .filter(|f| !f.rejected)
+                            .map(|f| f.id.clone())
+                            .collect(),
+                        frame_bases: if roll.optimize_individually {
+                            roll.frame_bases()
+                        } else {
+                            BTreeMap::new()
+                        },
+                    }
+            })
+    }
+    pub fn is_stale(&self, roll: &Roll) -> bool {
+        self.inputs.is_some() && !self.request_matches(roll)
+    }
+    pub fn for_frame(&self, id: &str) -> Option<&Analysis> {
+        if self.individual {
+            self.per_frame.get(id)
+        } else {
+            Some(&self.shared)
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +314,7 @@ pub struct RollState {
 pub struct ExportPreset {
     pub name: String,
     pub destination: Option<PathBuf>,
+    pub folder_suffix: String,
     pub tiff: bool,
     pub dng: bool,
     /// Zero keeps full resolution; otherwise constrain the longest edge.
@@ -84,6 +327,7 @@ impl Default for ExportPreset {
         Self {
             name: "Full-resolution JPEG".into(),
             destination: None,
+            folder_suffix: " - converted".into(),
             tiff: false,
             dng: false,
             long_edge: 0,
@@ -143,6 +387,7 @@ pub fn paste_edits(target: &mut Frame, source: &Frame, options: PasteOptions) {
     if options.composition {
         target.crop = source.crop;
         target.rotation = source.rotation;
+        target.mirrored = source.mirrored;
     }
     if options.dust {
         target.heals.clone_from(&source.heals);
@@ -155,6 +400,8 @@ pub struct EditClipboard {
     adjustments: Adjustments,
     crop: Rect,
     rotation: u8,
+    #[serde(default)]
+    mirrored: bool,
     heals: Vec<Heal>,
 }
 impl EditClipboard {
@@ -164,6 +411,7 @@ impl EditClipboard {
             adjustments: frame.adjustments,
             crop: frame.crop,
             rotation: frame.rotation,
+            mirrored: frame.mirrored,
             heals: frame.heals.clone(),
         })
         .unwrap()
@@ -214,6 +462,7 @@ impl EditClipboard {
         frame.adjustments = value.adjustments;
         frame.crop = value.crop;
         frame.rotation = value.rotation;
+        frame.mirrored = value.mirrored;
         frame.heals = value.heals;
         Some(frame)
     }
@@ -222,12 +471,15 @@ impl EditClipboard {
 pub struct Library {
     pub version: u32,
     pub rolls: Vec<Roll>,
+    #[serde(default)]
+    pub export_defaults: ExportPreset,
 }
 impl Default for Library {
     fn default() -> Self {
         Self {
             version: 1,
             rolls: Vec::new(),
+            export_defaults: ExportPreset::default(),
         }
     }
 }
@@ -255,8 +507,10 @@ impl Frame {
             path,
             rejected: false,
             adjustments: Adjustments::default(),
+            base: None,
             crop: Rect::default(),
             rotation: 0,
+            mirrored: false,
             heals: Vec::new(),
             error: None,
             review: false,
@@ -265,10 +519,41 @@ impl Frame {
     }
 }
 impl Roll {
+    pub fn frame_bases(&self) -> BTreeMap<String, [f32; 3]> {
+        self.frames
+            .iter()
+            .filter_map(|f| f.base.map(|base| (f.id.clone(), base)))
+            .collect()
+    }
+    pub fn analysis_inputs(&self) -> AnalysisInputs {
+        AnalysisInputs {
+            base: if self.optimize_individually {
+                None
+            } else {
+                self.base
+            },
+            area: self.analysis_area,
+            frames: self
+                .frames
+                .iter()
+                .filter(|f| !f.rejected)
+                .map(|f| f.id.clone())
+                .collect(),
+            frame_bases: if self.optimize_individually {
+                self.frame_bases()
+            } else {
+                BTreeMap::new()
+            },
+        }
+    }
+    pub fn analysis_for(&self, frame: &Frame) -> Option<&Analysis> {
+        self.analysis.as_ref()?.for_frame(&frame.id)
+    }
     pub fn new(name: &str) -> Self {
         Self {
             id: id(),
             name: name.into(),
+            source_folder: None,
             stock: String::new(),
             material: Material::default(),
             film_camera: String::new(),
@@ -279,12 +564,15 @@ impl Roll {
             adjustments: Adjustments::default(),
             analysis: None,
             previous_analysis: None,
+            optimize_individually: true,
+            calibration: greign_film::CalibrationOptions::default(),
             base: None,
             analysis_area: Rect {
                 x: 0.06,
                 y: 0.06,
                 w: 0.88,
                 h: 0.88,
+                angle: 0.0,
             },
             conversion_locked: false,
             versions: Vec::new(),
@@ -297,6 +585,8 @@ impl Roll {
         RollState {
             adjustments: self.adjustments,
             analysis: self.analysis.clone(),
+            optimize_individually: self.optimize_individually,
+            calibration: self.calibration,
             base: self.base,
             analysis_area: self.analysis_area,
             conversion_locked: self.conversion_locked,
@@ -313,6 +603,8 @@ impl Roll {
     pub fn restore_state(&mut self, state: &RollState) {
         self.adjustments = state.adjustments;
         self.analysis.clone_from(&state.analysis);
+        self.optimize_individually = state.optimize_individually;
+        self.calibration = state.calibration;
         self.base = state.base;
         self.analysis_area = state.analysis_area;
         self.conversion_locked = state.conversion_locked;
@@ -329,6 +621,7 @@ impl Roll {
                     },
                 );
                 frame.rejected = saved.rejected;
+                frame.base = saved.base;
                 frame.review = saved.review;
             }
         }
@@ -376,6 +669,13 @@ pub fn seed_demo(root: &Path) -> Roll {
     roll
 }
 pub fn supported(path: &Path) -> bool {
+    // macOS AppleDouble sidecars carry the original extension but no image data.
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("._"))
+    {
+        return false;
+    }
     path.extension().is_some_and(|v| {
         matches!(
             v.to_string_lossy().to_lowercase().as_str(),
@@ -401,6 +701,124 @@ pub fn supported(path: &Path) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn individual_calibration_handles_capture_exposure_and_roundtrips_legacy_state() {
+        let scan = greign_film::Scan {
+            image: greign_pipeline::LinearRgbImage {
+                width: 80,
+                height: 60,
+                pixels: (0..4800)
+                    .map(|i| [0.8, 0.5, 0.3].map(|v| v * 10_f32.powf(-((i % 80) as f32) / 60.)))
+                    .collect(),
+            },
+            camera_matrix: None,
+            white_balance: [1.; 3],
+            capture: "fixture".into(),
+        };
+        let mut darker = scan.clone();
+        for pixel in &mut darker.image.pixels {
+            for v in pixel {
+                *v *= 0.35;
+            }
+        }
+        let scans = [("a", &scan), ("b", &darker)];
+        let conversion = Conversion::analyze(
+            &scans,
+            true,
+            Some([0.8, 0.5, 0.3]),
+            Rect::default(),
+            greign_film::CalibrationOptions::default(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(conversion.individual);
+        assert!(conversion.for_frame("newly-imported").is_none());
+        assert!(
+            conversion.for_frame("a").unwrap().base[0]
+                > conversion.for_frame("b").unwrap().base[0] * 2.
+        );
+        let a = greign_film::prepare(
+            &scan,
+            Material::ColorNegative,
+            conversion.for_frame("a"),
+            false,
+            &|| false,
+        )
+        .unwrap();
+        let b = greign_film::prepare(
+            &darker,
+            Material::ColorNegative,
+            conversion.for_frame("b"),
+            false,
+            &|| false,
+        )
+        .unwrap();
+        for (a, b) in a
+            .image
+            .pixels
+            .iter()
+            .flatten()
+            .zip(b.image.pixels.iter().flatten())
+        {
+            assert!((a - b).abs() < 0.00001);
+        }
+        let restored: Conversion =
+            serde_json::from_str(&serde_json::to_string(&conversion).unwrap()).unwrap();
+        assert!(
+            restored.individual
+                && restored.for_frame("a").is_some()
+                && restored.for_frame("b").is_some()
+        );
+        let old_json = serde_json::to_string(conversion.for_frame("a").unwrap()).unwrap();
+        let legacy: Conversion = serde_json::from_str(&old_json).unwrap();
+        assert!(!legacy.individual && legacy.for_frame("any-frame").is_some());
+        let mut roll = Roll::new("versions");
+        let mut frame = Frame::new("a.png".into());
+        frame.mirrored = true;
+        roll.frames.push(frame);
+        roll.analysis = Some(restored);
+        roll.optimize_individually = true;
+        roll.calibration = greign_film::CalibrationOptions {
+            illumination: true,
+            color_balance: 0.75,
+        };
+        let state = roll.snapshot();
+        roll.frames[0].mirrored = false;
+        roll.optimize_individually = false;
+        roll.calibration = greign_film::CalibrationOptions::default();
+        roll.analysis = None;
+        roll.restore_state(&state);
+        assert_eq!(roll.calibration, state.calibration);
+        assert!(
+            roll.optimize_individually
+                && roll.frames[0].mirrored
+                && roll.analysis.as_ref().unwrap().individual
+        );
+        let clipboard = EditClipboard::encode(&roll.frames[0]);
+        assert!(EditClipboard::decode(&clipboard).unwrap().mirrored);
+    }
+    #[test]
+    fn import_ignores_appledouble_sidecars() {
+        assert!(supported(Path::new("IMG_0005.CR3")));
+        assert!(!supported(Path::new("._IMG_0005.CR3")));
+        assert!(!supported(Path::new("._scan.jpg")));
+    }
+    #[test]
+    fn new_rolls_default_to_individual_but_saved_modes_are_preserved() {
+        let roll = Roll::new("New roll");
+        assert!(roll.optimize_individually);
+        let mut value = serde_json::to_value(roll).unwrap();
+        value["optimize_individually"] = false.into();
+        let restored: Roll = serde_json::from_value(value.clone()).unwrap();
+        assert!(!restored.optimize_individually);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("optimize_individually");
+        let legacy: Roll = serde_json::from_value(value).unwrap();
+        assert!(!legacy.optimize_individually);
+    }
+
+    #[test]
     fn old_libraries_default_new_controls_to_neutral() {
         let mut value = serde_json::to_value(Roll::new("Old roll")).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -416,6 +834,10 @@ mod tests {
         assert_eq!(restored.adjustments.colors, [film_band(); 8]);
         assert!(!restored.conversion_locked);
         assert!(restored.versions.is_empty());
+        let mut frame = serde_json::to_value(Frame::new("old.png".into())).unwrap();
+        frame["crop"].as_object_mut().unwrap().remove("angle");
+        let restored: Frame = serde_json::from_value(frame).unwrap();
+        assert_eq!(restored.crop.angle, 0.0);
     }
     fn film_band() -> greign_film::ColorBand {
         greign_film::ColorBand::default()
@@ -428,12 +850,31 @@ mod tests {
         source.adjustments.highlights = -35.0;
         source.adjustments.colors[2].hue = 12.0;
         source.rotation = 1;
+        source.crop = Rect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.8,
+            h: 0.8,
+            angle: 2.3,
+        };
         source.review = true;
         let mut target = Frame::new("two.png".into());
         let identity = target.id.clone();
         paste_edits(&mut target, &source, PasteOptions::default());
         assert_eq!(target.adjustments, source.adjustments);
         assert_eq!(target.rotation, 0);
+        assert_eq!(target.crop.angle, 0.0);
+        let copied = EditClipboard::decode(&EditClipboard::encode(&source)).unwrap();
+        assert_eq!(copied.crop, source.crop);
+        paste_edits(
+            &mut target,
+            &copied,
+            PasteOptions {
+                composition: true,
+                ..PasteOptions::default()
+            },
+        );
+        assert_eq!(target.crop, source.crop);
         assert!(!target.review);
         assert_eq!(target.id, identity);
         roll.frames = vec![source, target];
@@ -478,6 +919,7 @@ mod tests {
         let mut library = Library {
             version: 1,
             rolls: vec![Roll::new("Original name")],
+            ..Library::default()
         };
         save(&path, &library).unwrap();
         library.rolls[0].name = "Edited name".into();

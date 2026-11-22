@@ -13,7 +13,15 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 mod adjustments;
+mod calibration;
+mod crop;
+mod upright;
+#[cfg(target_os = "linux")]
+mod upright_cuda;
 pub use adjustments::{COLOR_NAMES, ColorBand};
+pub use calibration::CalibrationOptions;
+pub use crop::detect_frame_crop;
+pub use upright::{UprightDetector, UprightGuess};
 
 /// Material captured by a roll.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +42,7 @@ pub struct Scan {
     pub image: LinearRgbImage,
     /// Camera transform, absent for sRGB raster inputs.
     pub camera_matrix: Option<[[f32; 3]; 3]>,
-    /// As-shot balance, used only for positive RAWs.
+    /// As-shot balance for original-scan display and positive RAWs, never inversion.
     pub white_balance: [f32; 3],
     /// Human-readable capture identity for incompatible-roll checks.
     pub capture: String,
@@ -51,6 +59,10 @@ pub struct Rect {
     pub w: f32,
     /// Height.
     pub h: f32,
+    /// Clockwise angle of the source frame, in degrees. Zero for analysis areas.
+    /// The output samples this tilted rectangle to straighten the picture.
+    #[serde(default)]
+    pub angle: f32,
 }
 impl Default for Rect {
     fn default() -> Self {
@@ -59,6 +71,7 @@ impl Default for Rect {
             y: 0.0,
             w: 1.0,
             h: 1.0,
+            angle: 0.0,
         }
     }
 }
@@ -66,7 +79,7 @@ impl Rect {
     /// Validate normalized bounds.
     #[must_use]
     pub fn valid(self) -> bool {
-        [self.x, self.y, self.w, self.h]
+        [self.x, self.y, self.w, self.h, self.angle]
             .iter()
             .all(|v| v.is_finite())
             && self.x >= 0.0
@@ -75,9 +88,24 @@ impl Rect {
             && self.h > 0.0
             && self.x + self.w <= 1.000_001
             && self.y + self.h <= 1.000_001
+            && self.angle.abs() <= 10.0
     }
     fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x <= self.x + self.w && y <= self.y + self.h
+    }
+    /// Overlap of two normalized rectangles, if nonempty.
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let area = Self {
+            x,
+            y,
+            w: (self.x + self.w).min(other.x + other.w) - x,
+            h: (self.y + self.h).min(other.y + other.h) - y,
+            angle: 0.0,
+        };
+        area.valid().then_some(area)
     }
 }
 
@@ -138,6 +166,9 @@ impl Adjustments {
     }
 }
 
+/// Current calibration algorithm, using picture boundaries for tonal range.
+pub const ANALYSIS_VERSION: u32 = 6;
+
 /// Reproducible, shared roll calibration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Analysis {
@@ -149,12 +180,25 @@ pub struct Analysis {
     pub floor: [f32; 3],
     /// Shared scalar density range, avoiding independent per-frame color stretches.
     pub range: f32,
+    /// Density-domain channel multipliers. Legacy recipes use unity.
+    #[serde(default = "unity_channels")]
+    pub channel_scale: [f32; 3],
+    /// Smooth log10 illumination field: x, y, x², y², xy about source center.
+    #[serde(default)]
+    pub illumination: [f32; 5],
+    /// Requested corrections, retained with the accepted calibration.
+    #[serde(default)]
+    pub options: CalibrationOptions,
     /// Base measurement method.
     pub method: String,
     /// Actionable limitations.
     pub warnings: Vec<String>,
     /// Number of frames used.
     pub frames: usize,
+}
+
+fn unity_channels() -> [f32; 3] {
+    [1.; 3]
 }
 
 /// Explicit manual repair in uncropped source coordinates.
@@ -215,13 +259,11 @@ pub fn load_scan(path: &Path, max_dimension: Option<u32>, demo: bool) -> Result<
         });
     }
     let raw = RawlerDecoder.mosaic(path)?;
-    let mut sensor = p::normalize_sensor(&raw)?;
-    if let Some(a) = raw.metadata.crop_area.or(raw.metadata.active_area) {
-        sensor = p::active_crop(&sensor, a.x, a.y, a.width, a.height)?;
-    }
-    if let Some(size) = max_dimension {
-        sensor = p::downsample_bayer(&sensor, size)?;
-    }
+    let sensor = p::normalize_scan(
+        &raw,
+        raw.metadata.crop_area.or(raw.metadata.active_area),
+        max_dimension,
+    )?;
     // No highlight invention, as-shot WB, display shoulder, or pre-inversion clipping.
     let rgb = p::ppg_demosaic(&sensor)?;
     let oriented = SrgbImage {
@@ -259,8 +301,15 @@ fn quantile(mut values: Vec<f32>, q: f32) -> f32 {
 fn channels(values: &[[f32; 3]], q: f32) -> [f32; 3] {
     std::array::from_fn(|c| quantile(values.iter().map(|p| p[c]).collect(), q))
 }
-fn samples(scan: &Scan, region: Rect) -> Vec<[f32; 3]> {
+#[allow(clippy::float_cmp)] // Exact zero is the persisted legacy bypass.
+fn samples(
+    scan: &Scan,
+    region: Rect,
+    picture: Option<Rect>,
+    illumination: [f32; 5],
+) -> Vec<[f32; 3]> {
     let step = (scan.image.pixels.len() / 60_000).max(1);
+    let aspect = scan.image.width as f32 / scan.image.height as f32;
     scan.image
         .pixels
         .iter()
@@ -270,9 +319,21 @@ fn samples(scan: &Scan, region: Rect) -> Vec<[f32; 3]> {
             let x = (i % scan.image.width as usize) as f32 / scan.image.width as f32;
             let y = (i / scan.image.width as usize) as f32 / scan.image.height as f32;
             (region.contains(x, y)
+                && picture.is_none_or(|area| {
+                    area.crop_point([x, y], aspect)
+                        .iter()
+                        .all(|v| (0.0..=1.0).contains(v))
+                })
                 && p.iter()
                     .all(|v| v.is_finite() && *v > 0.000_001 && *v < 0.995))
-            .then_some(*p)
+            .then(|| {
+                if illumination == [0.; 5] {
+                    *p
+                } else {
+                    let gain = 10_f32.powf(-calibration::field(illumination, x, y));
+                    p.map(|v| v * gain)
+                }
+            })
         })
         .collect()
 }
@@ -283,7 +344,7 @@ fn samples(scan: &Scan, region: Rect) -> Vec<[f32; 3]> {
 /// Invalid bounds, too few valid samples, or an unsuitable film-base patch.
 pub fn measure_base(scan: &Scan, region: Rect) -> Result<[f32; 3]> {
     ensure!(region.valid(), "Film-base selection is outside the image");
-    let v = samples(scan, region);
+    let v = samples(scan, region, None, [0.; 5]);
     let total = scan
         .image
         .pixels
@@ -317,17 +378,38 @@ pub fn measure_base(scan: &Scan, region: Rect) -> Result<[f32; 3]> {
 /// # Errors
 /// Empty/incompatible rolls or insufficient usable, unclipped scan data.
 pub fn analyze(scans: &[&Scan], explicit_base: Option<[f32; 3]>, region: Rect) -> Result<Analysis> {
+    analyze_with_options(scans, explicit_base, region, CalibrationOptions::default())
+}
+
+/// Estimate a calibration with optional border illumination and faded-film balance.
+/// Existing accepted recipes are unaffected until this proposal is accepted.
+///
+/// # Errors
+/// Invalid options, empty/incompatible scans, or insufficient valid samples.
+#[allow(clippy::too_many_lines)]
+pub fn analyze_with_options(
+    scans: &[&Scan],
+    explicit_base: Option<[f32; 3]>,
+    region: Rect,
+    options: CalibrationOptions,
+) -> Result<Analysis> {
     ensure!(!scans.is_empty(), "Import some frames first");
     ensure!(region.valid(), "Invalid analysis area");
+    ensure!(
+        options.color_balance.is_finite() && (0.0..=1.0).contains(&options.color_balance),
+        "Invalid color-density balance"
+    );
     ensure!(
         scans.iter().all(|s| s.capture == scans[0].capture),
         "Separate different cameras or input types into different rolls"
     );
     let mut candidates = Vec::new();
     let mut measured = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let areas: Vec<_> = scans.iter().map(|scan| detect_frame_crop(scan)).collect();
     for scan in scans {
-        let all = samples(scan, Rect::default());
+        // Base is measured from the uncropped scan, including unexposed film.
+        let all = samples(scan, Rect::default(), None, [0.; 5]);
         ensure!(all.len() > 32, "Not enough unclipped scan data");
         let candidate = channels(&all, 0.99);
         candidates.push(candidate);
@@ -363,7 +445,7 @@ pub fn analyze(scans: &[&Scan], explicit_base: Option<[f32; 3]>, region: Rect) -
             warnings.push("Some capture channels are clipped; those samples were excluded.".into());
         }
     }
-    let (base, method) = if let Some(base) = explicit_base {
+    let (mut base, mut method) = if let Some(base) = explicit_base {
         ensure!(
             base.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 0.995),
             "Invalid or clipped film base"
@@ -382,11 +464,62 @@ pub fn analyze(scans: &[&Scan], explicit_base: Option<[f32; 3]>, region: Rect) -
             },
         )
     };
+    let mut illumination = [0.; 5];
+    if options.illumination {
+        let models: Option<Vec<_>> = scans
+            .iter()
+            .zip(&areas)
+            .map(|(s, area)| calibration::illumination(s, (*area)?))
+            .collect();
+        if let Some(models) = models {
+            let field =
+                std::array::from_fn(|i| quantile(models.iter().map(|(_, f)| f[i]).collect(), 0.5));
+            // A shared field only makes sense for consistent capture geometry.
+            let consistent = models.iter().all(|(_, f)| {
+                [[0., 0.], [1., 0.], [0., 1.], [1., 1.]].iter().all(|p| {
+                    (calibration::field(*f, p[0], p[1]) - calibration::field(field, p[0], p[1]))
+                        .abs()
+                        < 0.08
+                })
+            });
+            if consistent {
+                illumination = field;
+                if explicit_base.is_none() {
+                    base = channels(&models.iter().map(|(b, _)| *b).collect::<Vec<_>>(), 0.5);
+                    method = "Measured film border · smooth illumination correction";
+                    warnings.retain(|w| !w.starts_with("No reliable film border"));
+                }
+            } else {
+                warnings.push("Border illumination varies across frames. Use individual optimization for illumination correction.".into());
+            }
+        } else {
+            warnings.push("Illumination correction was not applied: clean film base is required on all four sides. A flat-field capture is more reliable when borders are obscured.".into());
+        }
+    }
+    // The shared roll base assumes consistent scan exposure. Inferred base
+    // variation can also reflect scene content, so report it as a diagnostic.
+    if candidates.len() >= 2 {
+        let low = channels(&candidates, 0.0);
+        let high = channels(&candidates, 1.0);
+        if (0..3).all(|c| high[c] > low[c].max(0.000_001) * 1.5) {
+            warnings.push("Estimated film-base brightness varies across scans. Check capture exposure and backlight consistency; one shared calibration may not suit every frame.".into());
+        }
+    }
     let mut density = Vec::new();
-    for scan in scans {
-        for value in samples(scan, region) {
+    for (scan, area) in scans.iter().zip(&areas) {
+        for value in samples(scan, region, *area, illumination) {
+            // Exclude effectively opaque capture pixels when a picture boundary
+            // is unavailable. This is a signal floor, not a second crop detector.
+            if (0..3).all(|c| value[c] <= base[c] * 0.0001) {
+                continue;
+            }
             density.push(std::array::from_fn(|c| {
-                (base[c] / value[c]).log10().max(0.0)
+                let d = (base[c] / value[c]).log10();
+                if explicit_base.is_some() || illumination.iter().any(|v| *v != 0.) {
+                    d
+                } else {
+                    d.max(0.0)
+                }
             }));
         }
     }
@@ -394,16 +527,38 @@ pub fn analyze(scans: &[&Scan], explicit_base: Option<[f32; 3]>, region: Rect) -
         density.len() > 32,
         "The analysis area has too few valid samples"
     );
-    let floor = channels(&density, 0.005);
+    let mut floor = channels(&density, 0.005);
     let top = channels(&density, 0.995);
-    let range = ((top[0] - floor[0] + top[1] - floor[1] + top[2] - floor[2]) / 3.0).max(0.15);
+    let mut range = ((top[0] - floor[0] + top[1] - floor[1] + top[2] - floor[2]) / 3.0).max(0.15);
+    let channel_scale = std::array::from_fn(|c| {
+        let target = (range / (top[c] - floor[c]).max(0.15)).clamp(0.5, 2.);
+        1. + options.color_balance * (target - 1.)
+    });
+    if explicit_base.is_some() {
+        // Independent channel black points cancel log(base) entirely. A manual
+        // base must anchor color: remove only one common scanner-density offset
+        // after any dye-slope balancing, preserving relative channel densities.
+        let common = (0..3)
+            .map(|c| floor[c] * channel_scale[c])
+            .fold(f32::INFINITY, f32::min);
+        floor = std::array::from_fn(|c| common / channel_scale[c]);
+        // Cover the restored channel highlights with one shared print range.
+        // The former range was measured after independent channel offsets and
+        // would overexpose a channel whose offset we have deliberately retained.
+        range = (0..3)
+            .map(|c| (top[c] - floor[c]) * channel_scale[c])
+            .fold(0.15_f32, f32::max);
+    }
     warnings.sort();
     warnings.dedup();
     Ok(Analysis {
-        version: 1,
+        version: ANALYSIS_VERSION,
         base,
         floor,
         range,
+        channel_scale,
+        illumination,
+        options,
         method: method.into(),
         warnings,
         frames: scans.len(),
@@ -422,6 +577,7 @@ pub fn render(
     edits: Adjustments,
     crop: Rect,
     rotation: u8,
+    mirrored: bool,
     heals: &[Heal],
     show_negative: bool,
 ) -> Result<SrgbImage> {
@@ -432,6 +588,7 @@ pub fn render(
         edits,
         crop,
         rotation,
+        mirrored,
         heals,
         show_negative,
     )?))
@@ -450,11 +607,12 @@ pub fn render_linear(
     edits: Adjustments,
     crop: Rect,
     rotation: u8,
+    mirrored: bool,
     heals: &[Heal],
     show_negative: bool,
 ) -> Result<LinearRgbImage> {
     let prepared = prepare(scan, material, analysis, show_negative, &|| false)?;
-    finish(&prepared, edits, crop, rotation, heals, &|| false)
+    finish(&prepared, edits, crop, rotation, mirrored, heals, &|| false)
 }
 
 /// Cached conversion before creative edits; independent of crop and healing.
@@ -476,8 +634,32 @@ pub fn prepare(
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Prepared> {
     ensure!(!cancelled(), "Preview superseded");
-    let mut rgb = scan.image.clone();
+    prepare_owned(scan.clone(), material, analysis, show_negative, cancelled)
+}
+
+/// Prepares an exclusively owned scan, reusing its full-resolution pixel storage.
+/// # Errors
+/// Invalid analysis/matrix, or a superseded preview request.
+pub fn prepare_owned(
+    scan: Scan,
+    material: Material,
+    analysis: Option<&Analysis>,
+    show_negative: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Prepared> {
+    ensure!(!cancelled(), "Preview superseded");
+    let mut rgb = scan.image;
     if show_negative {
+        // Calibration needs untouched camera channels, but a human viewing the
+        // negative needs the same as-shot WB as a normal RAW preview. Applying
+        // the color matrix to unbalanced channels produced a strong green cast.
+        if scan.camera_matrix.is_some() {
+            for pixel in &mut rgb.pixels {
+                for (c, v) in pixel.iter_mut().enumerate() {
+                    *v *= scan.white_balance[c];
+                }
+            }
+        }
         let high = rgb
             .pixels
             .iter()
@@ -492,14 +674,33 @@ pub fn prepare(
         }
     } else if material != Material::Positive {
         let a = analysis.ok_or_else(|| anyhow::anyhow!("Analyze & convert this roll first"))?;
-        rgb.pixels
-            .par_chunks_mut(8192)
-            .try_for_each(|chunk| -> Result<()> {
+        ensure!(
+            a.range.is_finite()
+                && a.range > 0.
+                && a.base.iter().all(|v| v.is_finite() && *v > 0.)
+                && a.floor.iter().chain(&a.illumination).all(|v| v.is_finite())
+                && a.channel_scale
+                    .iter()
+                    .all(|v| v.is_finite() && (0.5..=2.).contains(v)),
+            "Invalid negative calibration"
+        );
+        let width = rgb.width as usize;
+        let height = rgb.height as f32;
+        rgb.pixels.par_chunks_mut(8192).enumerate().try_for_each(
+            |(chunk_index, chunk)| -> Result<()> {
                 ensure!(!cancelled(), "Preview superseded");
-                for pixel in chunk {
+                for (offset, pixel) in chunk.iter_mut().enumerate() {
+                    let index = chunk_index * 8192 + offset;
+                    let illumination = calibration::field(
+                        a.illumination,
+                        (index % width) as f32 / width as f32,
+                        (index / width) as f32 / height,
+                    );
                     for (c, v) in pixel.iter_mut().enumerate() {
-                        let density =
-                            ((a.base[c] / v.max(0.000_001)).log10() - a.floor[c]) / a.range;
+                        let density = ((a.base[c] / v.max(0.000_001)).log10() + illumination
+                            - a.floor[c])
+                            / a.range
+                            * a.channel_scale[c];
                         let paper = ((1.0 - 10.0_f32.powf(-density.max(0.0))) / 0.9)
                             .max(0.0)
                             .powf(2.6);
@@ -511,7 +712,8 @@ pub fn prepare(
                     }
                 }
                 Ok(())
-            })?;
+            },
+        )?;
     } else if scan.camera_matrix.is_some() {
         for pixel in &mut rgb.pixels {
             for (c, v) in pixel.iter_mut().enumerate() {
@@ -539,7 +741,8 @@ pub fn prepare(
     })
 }
 
-/// Apply creative edits to a cached conversion, with cooperative cancellation.
+/// Apply creative edits, crop, rotation, then optional left-to-right mirroring.
+/// Supports cooperative cancellation; repair coordinates remain in source space.
 /// # Errors
 /// Invalid crop/heal or a superseded preview request.
 pub fn finish(
@@ -547,10 +750,14 @@ pub fn finish(
     edits: Adjustments,
     crop: Rect,
     rotation: u8,
+    mirrored: bool,
     heals: &[Heal],
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<LinearRgbImage> {
-    ensure!(crop.valid(), "Invalid crop");
+    ensure!(
+        crop.valid_for(prepared.image.width, prepared.image.height),
+        "Invalid crop"
+    );
     ensure!(!cancelled(), "Preview superseded");
     let mut rgb = prepared.image.clone();
     let material = prepared.material;
@@ -593,26 +800,12 @@ pub fn finish(
             apply_heal(&mut rgb, *heal)?;
         }
     }
-    let x = (crop.x * rgb.width as f32) as u32;
-    let y = (crop.y * rgb.height as f32) as u32;
-    let w = ((crop.w * rgb.width as f32) as u32)
-        .max(1)
-        .min(rgb.width - x);
-    let h = ((crop.h * rgb.height as f32) as u32)
-        .max(1)
-        .min(rgb.height - y);
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    for row in y..y + h {
-        ensure!(!cancelled(), "Preview superseded");
-        pixels.extend_from_slice(
-            &rgb.pixels[(row * rgb.width + x) as usize..(row * rgb.width + x + w) as usize],
-        );
-    }
+    let cropped = crop::apply_crop(&rgb, crop, cancelled)?;
     // Orientation only permutes pixels; this container performs no transfer curve.
-    let output = SrgbImage {
-        width: w,
-        height: h,
-        pixels,
+    let mut output = SrgbImage {
+        width: cropped.width,
+        height: cropped.height,
+        pixels: cropped.pixels,
     }
     .oriented(match rotation % 4 {
         1 => greign_raw::Orientation::Rotate90,
@@ -620,6 +813,12 @@ pub fn finish(
         3 => greign_raw::Orientation::Rotate270,
         _ => greign_raw::Orientation::Normal,
     });
+    if mirrored {
+        for row in output.pixels.chunks_exact_mut(output.width as usize) {
+            ensure!(!cancelled(), "Preview superseded");
+            row.reverse();
+        }
+    }
     Ok(LinearRgbImage {
         width: output.width,
         height: output.height,
@@ -710,6 +909,96 @@ fn apply_heal(image: &mut LinearRgbImage, heal: Heal) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn mirror_reverses_display_rows_after_crop_and_every_rotation() {
+        let scan = scan();
+        let analysis = analyze(&[&scan], Some([0.8, 0.5, 0.3]), Rect::default()).unwrap();
+        let prepared = prepare(
+            &scan,
+            Material::ColorNegative,
+            Some(&analysis),
+            false,
+            &|| false,
+        )
+        .unwrap();
+        let crop = Rect {
+            x: 0.15,
+            y: 0.2,
+            w: 0.61,
+            h: 0.55,
+            angle: 0.0,
+        };
+        for rotation in 0..4 {
+            let normal = finish(
+                &prepared,
+                Adjustments::default(),
+                crop,
+                rotation,
+                false,
+                &[],
+                &|| false,
+            )
+            .unwrap();
+            let mirrored = finish(
+                &prepared,
+                Adjustments::default(),
+                crop,
+                rotation,
+                true,
+                &[],
+                &|| false,
+            )
+            .unwrap();
+            assert_eq!(
+                (normal.width, normal.height),
+                (mirrored.width, mirrored.height)
+            );
+            for (a, b) in normal
+                .pixels
+                .chunks_exact(normal.width as usize)
+                .zip(mirrored.pixels.chunks_exact(mirrored.width as usize))
+            {
+                assert!(a.iter().rev().eq(b));
+            }
+        }
+    }
+    #[test]
+    fn original_preview_balances_camera_channels_without_touching_calibration() {
+        let mut scan = scan();
+        scan.image.pixels.fill([0.1, 0.2, 0.2 / 3.]);
+        scan.white_balance = [2., 1., 3.];
+        scan.camera_matrix = Some([
+            [1.0424, -0.3138, -0.1300],
+            [-0.4221, 1.1938, 0.2584],
+            [-0.0547, 0.1658, 0.6183],
+        ]);
+        let original = scan.image.pixels.clone();
+        let a = analyze(&[&scan], Some([0.8, 0.5, 0.3]), Rect::default()).unwrap();
+        let positive = prepare(&scan, Material::ColorNegative, Some(&a), false, &|| false).unwrap();
+        let displayed = render(
+            &scan,
+            Material::ColorNegative,
+            None,
+            Adjustments::default(),
+            Rect::default(),
+            0,
+            false,
+            &[],
+            true,
+        )
+        .unwrap();
+        for pixel in displayed.pixels {
+            assert!((pixel[0] - pixel[1]).abs() < 0.0001);
+            assert!((pixel[1] - pixel[2]).abs() < 0.0001);
+        }
+        assert_eq!(scan.image.pixels, original);
+        scan.white_balance = [4., 1., 0.5];
+        let b = analyze(&[&scan], Some([0.8, 0.5, 0.3]), Rect::default()).unwrap();
+        assert_eq!(a.base, b.base);
+        assert_eq!(a.range, b.range);
+        let other = prepare(&scan, Material::ColorNegative, Some(&b), false, &|| false).unwrap();
+        assert_eq!(positive.image.pixels, other.image.pixels);
+    }
+    #[test]
     fn cached_conversion_matches_direct_render_and_cancels() {
         let scan = scan();
         let analysis = analyze(&[&scan], Some([0.8, 0.5, 0.3]), Rect::default()).unwrap();
@@ -733,13 +1022,14 @@ mod tests {
             edits,
             Rect::default(),
             1,
+            false,
             &[],
             false,
         )
         .unwrap();
-        let cached = finish(&prepared, edits, Rect::default(), 1, &[], &|| false).unwrap();
+        let cached = finish(&prepared, edits, Rect::default(), 1, false, &[], &|| false).unwrap();
         assert_eq!(direct.pixels, cached.pixels);
-        assert!(finish(&prepared, edits, Rect::default(), 0, &[], &|| true).is_err());
+        assert!(finish(&prepared, edits, Rect::default(), 0, false, &[], &|| true).is_err());
         assert!(
             prepare(
                 &scan,
@@ -779,6 +1069,7 @@ mod tests {
             Adjustments::default(),
             Rect::default(),
             0,
+            false,
             &[],
             false,
         )
@@ -819,8 +1110,10 @@ mod tests {
                 y: 0.1,
                 w: 0.5,
                 h: 0.5,
+                angle: 0.0,
             },
             1,
+            false,
             &[],
             false,
         )

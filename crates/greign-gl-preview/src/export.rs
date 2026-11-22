@@ -202,16 +202,17 @@ impl Preview {
 }
 
 fn dimensions(width: u32, height: u32, crop: Rect, rotation: u8) -> Result<(u32, u32)> {
-    ensure!(
-        width > 0 && height > 0 && crop.valid(),
-        "Invalid export dimensions"
-    );
+    ensure!(crop.valid_for(width, height), "Invalid export dimensions");
     let x = (crop.x * width as f32) as u32;
     let y = (crop.y * height as f32) as u32;
     ensure!(x < width && y < height, "Export crop has no source pixels");
     let w = ((crop.w * width as f32) as u32).max(1).min(width - x);
     let h = ((crop.h * height as f32) as u32).max(1).min(height - y);
-    Ok(if rotation % 2 == 0 { (w, h) } else { (h, w) })
+    Ok(if rotation.is_multiple_of(2) {
+        (w, h)
+    } else {
+        (h, w)
+    })
 }
 
 #[cfg(test)]
@@ -224,6 +225,7 @@ mod tests {
             y: 0.137,
             w: 0.753,
             h: 0.751,
+            angle: 0.0,
         };
         assert_eq!(dimensions(128, 96, crop, 0).unwrap(), (96, 72));
         assert_eq!(dimensions(128, 96, crop, 1).unwrap(), (72, 96));

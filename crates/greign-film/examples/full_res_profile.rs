@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
             },
             Rect::default(),
             0,
+            false,
             &[],
             &|| false,
         )?;

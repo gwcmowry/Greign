@@ -193,6 +193,7 @@ impl Lane {
                             } else {
                                 request.frame.rotation
                             },
+                            !request.negative && request.frame.mirrored,
                             &request.frame.heals,
                             &cancelled,
                         )?;

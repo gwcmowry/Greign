@@ -29,6 +29,7 @@ pub struct Settings {
     pub material: Material,
     pub crop: Rect,
     pub rotation: u8,
+    pub mirrored: bool,
 }
 impl Preview {
     /// Called by eframe while its GL context is current. All later operations
@@ -178,7 +179,7 @@ impl Preview {
     }
     fn draw_mode(&self, settings: Settings, window: [f32; 4], export: i32) {
         self.check_thread();
-        if !self.alive || !settings.crop.valid() {
+        if !self.alive || !settings.crop.valid_for(self.width, self.height) {
             return;
         }
         // SAFETY: GL resources were created on this thread, remain alive until
@@ -235,17 +236,7 @@ impl Preview {
                 gl.get_uniform_location(self.program, "bands[0]").as_ref(),
                 &bands,
             );
-            let mut crop = settings.crop;
-            let width = self.width as f32;
-            let height = self.height as f32;
-            crop.x = (crop.x * width).floor() / width;
-            crop.y = (crop.y * height).floor() / height;
-            crop.w = (crop.w * width).floor().max(1.).min(width - crop.x * width) / width;
-            crop.h = (crop.h * height)
-                .floor()
-                .max(1.)
-                .min(height - crop.y * height)
-                / height;
+            let crop = settings.crop.rasterized(self.width, self.height);
             gl.uniform_4_f32(
                 gl.get_uniform_location(self.program, "crop").as_ref(),
                 crop.x,
@@ -253,9 +244,31 @@ impl Preview {
                 crop.w,
                 crop.h,
             );
+            let (sin, cos) = crop.angle.to_radians().sin_cos();
+            let grid = crop.sampling_grid(self.width, self.height);
+            gl.uniform_2_f32_slice(
+                gl.get_uniform_location(self.program, "sample_grid[0]")
+                    .as_ref(),
+                &grid.concat(),
+            );
+            gl.uniform_2_f32(
+                gl.get_uniform_location(self.program, "sample_size")
+                    .as_ref(),
+                (crop.w * self.width as f32).floor().max(1.),
+                (crop.h * self.height as f32).floor().max(1.),
+            );
+            gl.uniform_2_f32(
+                gl.get_uniform_location(self.program, "tilt").as_ref(),
+                sin,
+                cos,
+            );
             gl.uniform_1_i32(
                 gl.get_uniform_location(self.program, "rotation").as_ref(),
                 i32::from(settings.rotation % 4),
+            );
+            gl.uniform_1_i32(
+                gl.get_uniform_location(self.program, "mirrored").as_ref(),
+                i32::from(settings.mirrored),
             );
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_vertex_array(None);
