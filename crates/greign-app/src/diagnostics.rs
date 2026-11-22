@@ -27,6 +27,7 @@ pub fn neutral(
         edits,
         Rect::default(),
         0,
+        false,
         &[],
         &|| false,
     )?);
@@ -94,7 +95,7 @@ impl App {
         }
         let key = self.neutral_key();
         let material = roll.material;
-        let analysis = roll.analysis.clone();
+        let analysis = roll.analysis_for(frame).cloned();
         let edits = roll.adjustments.combined(frame.adjustments);
         let tx = self.tx.clone();
         let ctx = ctx.clone();
@@ -127,21 +128,12 @@ impl App {
             self.histogram_key.clear();
             return;
         };
-        let edits = version
-            .map_or(roll.adjustments, |v| v.state.adjustments)
-            .combined(frame.adjustments);
+        let edits = self.displayed_adjustments(roll, frame);
         let material = roll.material;
-        let analysis = if let Some(version) = version {
-            version.state.analysis.clone()
-        } else if self.preview_analysis {
-            self.pending_analysis
-                .as_ref()
-                .filter(|(id, _)| *id == roll.id)
-                .map(|(_, a)| a.clone())
-                .or_else(|| roll.analysis.clone())
-        } else {
-            roll.analysis.clone()
-        };
+        let analysis = self
+            .displayed_conversion(roll)
+            .and_then(|a| a.for_frame(&frame.id))
+            .cloned();
         let negative = (!self.comparing && self.show_negative)
             || (analysis.is_none() && material != Material::Positive);
         let key = serde_json::to_string(&(
@@ -151,6 +143,7 @@ impl App {
             edits,
             frame.crop,
             frame.rotation,
+            frame.mirrored,
             &frame.heals,
             negative,
         ))
@@ -187,6 +180,7 @@ impl App {
                         frame.crop
                     },
                     if negative { 0 } else { frame.rotation },
+                    !negative && frame.mirrored,
                     &frame.heals,
                     negative,
                 )?;
@@ -232,6 +226,7 @@ mod tests {
                 },
                 Rect::default(),
                 0,
+                false,
                 &[],
                 false,
             )
@@ -282,6 +277,7 @@ mod tests {
             },
             Rect::default(),
             0,
+            false,
             &[],
             &|| false,
         )

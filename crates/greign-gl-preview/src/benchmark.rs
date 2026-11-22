@@ -52,6 +52,7 @@ pub fn run(gl: Arc<glow::Context>, root: &Path) -> Result<()> {
         b.lightness = -5.;
     }
     let settings = Settings {
+        mirrored: false,
         edits,
         material: Material::ColorNegative,
         crop: Rect::default(),
@@ -110,6 +111,7 @@ pub fn run(gl: Arc<glow::Context>, root: &Path) -> Result<()> {
                 frame_settings.edits,
                 Rect::default(),
                 0,
+                false,
                 &[],
                 &|| false,
             )?);
@@ -166,43 +168,53 @@ pub fn run(gl: Arc<glow::Context>, root: &Path) -> Result<()> {
     ] {
         let base = greign_film::prepare(&synthetic, material, Some(&analysis), false, &|| false)?;
         preview.upload("parity".into(), &base.image)?;
-        for rotation in 0..4 {
-            let crop = Rect {
-                x: 0.127,
-                y: 0.137,
-                w: 0.753,
-                h: 0.751,
-            };
-            let settings = Settings {
-                edits,
-                material,
-                crop,
-                rotation,
-            };
-            let cpu = greign_pipeline::rec2020_to_srgb(greign_film::finish(
-                &base,
-                edits,
-                crop,
-                rotation,
-                &[],
-                &|| false,
-            )?);
-            let target = Target::new(&gl, cpu.width, cpu.height)?;
-            unsafe {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.fbo));
-                gl.viewport(0, 0, cpu.width as i32, cpu.height as i32);
+        for (rotation, angle) in
+            (0..4).flat_map(|rotation| [0., -2.3, 3.1].map(move |angle| (rotation, angle)))
+        {
+            for mirrored in [false, true] {
+                let crop = Rect {
+                    x: 0.127,
+                    y: 0.137,
+                    w: 0.753,
+                    h: 0.751,
+                    angle,
+                };
+                let settings = Settings {
+                    mirrored,
+                    edits,
+                    material,
+                    crop,
+                    rotation,
+                };
+                let cpu = greign_pipeline::rec2020_to_srgb(greign_film::finish(
+                    &base,
+                    edits,
+                    crop,
+                    rotation,
+                    mirrored,
+                    &[],
+                    &|| false,
+                )?);
+                let target = Target::new(&gl, cpu.width, cpu.height)?;
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.fbo));
+                    gl.viewport(0, 0, cpu.width as i32, cpu.height as i32);
+                }
+                preview.draw(settings);
+                let gpu = target.read(&gl)?;
+                target.destroy(&gl);
+                let cpu = cpu.to_rgb8();
+                let (mean, max) = difference(&gpu, &cpu);
+                writeln!(
+                    log,
+                    "parity,{material:?},{rotation},{mirrored},{angle},{mean:.6},{max}"
+                )?;
+                log.flush()?;
+                ensure!(
+                    mean < 0.1 && max <= 3,
+                    "GPU parity failed for {material:?}, rotation {rotation}: mean {mean}, max {max} RGB8 levels"
+                );
             }
-            preview.draw(settings);
-            let gpu = target.read(&gl)?;
-            target.destroy(&gl);
-            let cpu = cpu.to_rgb8();
-            let (mean, max) = difference(&gpu, &cpu);
-            writeln!(log, "parity,{material:?},{rotation},{mean:.6},{max}")?;
-            log.flush()?;
-            ensure!(
-                mean < 0.1 && max <= 3,
-                "GPU parity failed for {material:?}, rotation {rotation}: mean {mean}, max {max} RGB8 levels"
-            );
         }
         let window = [0.25, 0.25, 0.5, 0.5];
         let crop = Rect {
@@ -210,12 +222,14 @@ pub fn run(gl: Arc<glow::Context>, root: &Path) -> Result<()> {
             y: window[1],
             w: window[2],
             h: window[3],
+            angle: 0.0,
         };
         let cpu = greign_pipeline::rec2020_to_srgb(greign_film::finish(
             &base,
             edits,
             crop,
             0,
+            false,
             &[],
             &|| false,
         )?);
@@ -226,6 +240,7 @@ pub fn run(gl: Arc<glow::Context>, root: &Path) -> Result<()> {
         }
         preview.draw_window(
             Settings {
+                mirrored: false,
                 edits,
                 material,
                 crop: Rect::default(),

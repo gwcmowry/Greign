@@ -27,7 +27,7 @@ pub use scheduler::{
     select_viewport_level, tile_regions,
 };
 pub use sensor::{
-    active_crop, apply_white_balance, downsample_bayer, normalize_sensor,
+    active_crop, apply_white_balance, downsample_bayer, normalize_scan, normalize_sensor,
     reconstruct_clipped_samples, repair_bad_pixels,
 };
 pub use types::{

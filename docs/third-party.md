@@ -1,5 +1,28 @@
 # Third-party data
 
+## Local upright-detection model
+
+`greign-film` embeds OpenCV Zoo's 232,589-byte `face_detection_yunet_2023mar.onnx`
+model. YuNet detects faces and five landmarks; Greign uses their evidence for
+quarter-turn orientation, with abstention when the orientation is uncertain.
+The weights are MIT licensed, copyright 2020 Shiqi Yu. Source, checksum, input
+conventions, and the complete license are in
+[`crates/greign-film/models`](../crates/greign-film/models/README.md).
+The binary notice collector includes `YUNET-LICENSE` automatically.
+
+Tract 0.22.1 (MIT or Apache-2.0) executes the bundled model on the CPU. There are
+no runtime downloads, Python dependency, cloud calls, or image uploads for CPU inference. The
+lockfile pins `psm` 0.1.24 because newer versions pull in an archive writer that
+requires Rust syntax beyond the workspace's declared Rust 1.85 minimum.
+
+Optional Linux CUDA inference uses `ort` 2.0.0-rc.10 (MIT or Apache-2.0) to load
+ONNX Runtime 1.22.0 (MIT) dynamically. `scripts/setup-upright-gpu.py` installs
+the pinned optional runtime under the user's workspace with UV. NVIDIA CUDA
+and cuDNN packages retain their vendor license files in that local installation;
+they are not embedded in the Greign binary or macOS bundle. The model and its
+MIT notice are shared by both inference paths. Runtime CUDA uses FP32 with TF32
+disabled; CUDA initialization/compute failures return to the CPU implementation.
+
 ## Binary distribution notices
 
 macOS bundles include `ThirdPartyNotices.txt`, generated from dependency

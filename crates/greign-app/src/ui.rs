@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 use super::{Action, App, Panel, Roll, Tool};
+mod conversion;
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use greign_film::{self as film, Adjustments, Heal, Material, Rect};
 
@@ -32,7 +33,7 @@ pub fn style(ctx: &egui::Context) {
     });
 }
 fn muted(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.label(RichText::new(text).color(MUTED).size(12.0));
+    ui.add(egui::Label::new(RichText::new(text).color(MUTED).size(12.0)).wrap());
 }
 fn primary(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).color(Color32::from_rgb(30, 27, 22))).fill(GOLD))
@@ -80,6 +81,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                 }
                 ui.label(RichText::new(&app.status).size(12.0));
                 if app.busy {
+                    if let Some(batch) = &app.export_batch {
+                        ui.label(format!("Roll {}/{}", batch.completed + 1, batch.total));
+                    }
                     if let Some((done, total, bytes, elapsed)) = app.export_progress {
                         ui.add(
                             egui::ProgressBar::new(done as f32 / total.max(1) as f32)
@@ -131,6 +135,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
             ui.add_space(20.0);
             muted(ui, "YOUR ROLLS");
             ui.add_space(8.0);
+            egui::ScrollArea::vertical().id_salt("roll-list").max_height((ui.available_height() - 220.0).max(100.0)).show(ui, |ui| {
             for (i, r) in app.library.rolls.iter().enumerate() {
                 let text = format!(
                     "{}\n{} frames{}",
@@ -159,6 +164,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     app.actions.push(Action::Load);
                 }
             }
+            });
             ui.add_space(12.0);
             if ui
                 .add_enabled(
@@ -169,10 +175,14 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
             {
                 app.new_roll_open = true;
             }
+            if ui.add_enabled(!app.busy && !app.preview_analysis && !app.comparing && !app.library.rolls.is_empty(), egui::Button::new("Export ready rolls…").min_size(Vec2::new(164.0, 32.0))).clicked() {
+                app.export_scope = super::ExportScope::AllReady;
+                app.export_dialog = true;
+            }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 muted(
                     ui,
-                    "Arrow keys  Navigate\nR  Keep / reject\nCtrl Z  Undo\nEsc  Leave tool",
+                    "Arrow keys  Navigate\nR  Rotate · Shift+R  Reverse\nX  Keep / reject\nCtrl Z  Undo\nEsc  Leave tool",
                 );
                 ui.separator();
                 muted(
@@ -213,10 +223,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             let r = app.library.rolls[app.roll].clone();
             ui.horizontal(|ui| {
-                ui.heading(&r.name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let kept = r.frames.iter().filter(|f| !f.rejected).count();
-                    let ready = r.analysis.is_some() || r.material == Material::Positive;
+            let ready = r.material == Material::Positive || r.frames.iter().filter(|f| !f.rejected).all(|f| r.analysis_for(f).is_some());
                     if ui
                         .add_enabled(
                             !app.busy
@@ -229,13 +238,26 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                             )
                             .fill(GOLD),
                         )
+                        .on_disabled_hover_text(if app.preview_analysis { "Apply the new conversion before exporting it." } else { "Finish processing and analyze all kept frames before exporting." })
                         .clicked()
                     {
+                        app.export_scope = super::ExportScope::Roll;
+                        if r.export.destination.is_some() {
+                            app.actions.push(Action::Export);
+                        } else {
+                            app.export_dialog = true;
+                        }
+                    }
+                    if ui.button("Export settings…").clicked() {
+                        app.export_scope = super::ExportScope::Roll;
                         app.export_dialog = true;
                     }
                     if ui.button("Metadata").clicked() {
                         app.metadata_open = true;
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(&r.name).heading()).truncate()).on_hover_text(&r.name);
+                    });
                 });
             });
             ui.horizontal(|ui| {
@@ -260,15 +282,21 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                 }
             });
             ui.add_space(10.0);
+            if r.material != Material::Positive {
+                ui.add_enabled_ui(!app.busy && !app.comparing && !r.conversion_locked, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Conversion:");
+                        if ui.selectable_label(r.optimize_individually, "Optimize frames individually").clicked() {app.actions.push(Action::SetIndividual(true));}
+                        if ui.selectable_label(!r.optimize_individually, "Shared roll calibration").clicked() {app.actions.push(Action::SetIndividual(false));}
+                    });
+                });
+                muted(ui, if r.optimize_individually {"Each frame gets its own conversion. Build a preview, compare, then apply."} else {"One conversion for consistent capture settings. Build a preview, compare, then apply."});
+            }
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !app.busy && !r.frames.is_empty() && r.material != Material::Positive,
-                        egui::Button::new(if r.analysis.is_some() {
-                            "Re-analyze & convert"
-                        } else {
-                            "Analyze & convert roll"
-                        }),
+                        egui::Button::new(conversion::build_label(app, &r)),
                     )
                     .clicked()
                 {
@@ -279,6 +307,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     .clicked()
                 {
                     app.actions.push(Action::Import);
+                }
+                if ui.add_enabled(!app.busy && !r.demo, egui::Button::new("Add folder…")).clicked() {
+                    app.actions.push(Action::ImportFolder);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(!app.grid, "Single frame").clicked() {
@@ -291,11 +322,30 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                 });
             });
             ui.add_space(8.0);
-            if r.analysis.as_ref().is_some_and(|a| !a.warnings.is_empty()) {
-                ui.colored_label(
-                    GOLD,
-                    "Analysis needs attention · see Conversion for details",
-                );
+            ui.add_enabled_ui(!app.busy && !app.comparing && !app.preview_analysis && !r.frames.is_empty(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Whole roll:");
+                    if ui.button("Autocrop all frames").on_hover_text("Crop each picture inside its film base and straighten slight tilt. Uncertain frames keep their current crops. Undo restores the entire batch.").clicked() {
+                        app.actions.push(Action::AutoCropAll);
+                    }
+                    if ui.add_enabled(r.material == Material::Positive || r.analysis.is_some(), egui::Button::new("Auto upright")).on_hover_text("Use a local face model to find upright people in converted photos. Clear matches get quarter-turn rotations; uncertain frames keep their orientation and are marked for review. Apply a conversion first. Undo restores the whole batch.").clicked() {
+                        app.actions.push(Action::AutoUpright);
+                    }
+                    let mirrored_count = r.frames.iter().filter(|f| f.mirrored).count();
+                    let mut mirrored = !r.frames.is_empty() && mirrored_count == r.frames.len();
+                    let mixed = mirrored_count > 0 && !mirrored;
+                    if ui.add(egui::Checkbox::new(&mut mirrored, "Mirror all frames").indeterminate(mixed)).on_hover_text("Set left-to-right mirroring for every frame. Each frame keeps its own rotation and crop.").changed() {
+                        app.actions.push(Action::MirrorAll(mirrored));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            if app.pending_analysis.as_ref().is_none_or(|p| p.roll_id != r.id) {
+                if r.analysis.as_ref().is_some_and(|a| a.individual && a.per_frame.values().any(|analysis| analysis.version < film::ANALYSIS_VERSION)) {
+                    ui.colored_label(GOLD, "Updated conversion available · build a new preview");
+                } else if r.analysis.as_ref().is_some_and(|a| !a.shared.warnings.is_empty()) {
+                    muted(ui, "Some frames have conversion notes · see Conversion for details");
+                }
             }
             if app.grid && !r.frames.is_empty() {
                 ui.horizontal_wrapped(|ui| {
@@ -312,6 +362,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     if ui.small_button("Clear selection").clicked() {
                         app.selected.clear();
                     }
+                    if ui.add_enabled(!app.busy && !app.comparing && !app.preview_analysis,
+                        egui::Button::new(if app.selected.is_empty() {"Rotate frame · R"} else {"Rotate selected · R"}))
+                        .on_hover_text("Rotate clockwise. Shift+R rotates counterclockwise. One Undo restores all affected frames.").clicked() {
+                        app.actions.push(Action::Rotate);
+                    }
                     if ui
                         .add_enabled(
                             !app.selected.is_empty(),
@@ -325,17 +380,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     }
                 });
             }
+            conversion::review(app, ui, &r);
             if app.comparing {
-                ui.colored_label(
-                    GOLD,
-                    "SAVED VERSION · release compare to return to current edits",
-                );
-            }
-            if app.preview_analysis {
-                ui.colored_label(
-                    GOLD,
-                    "PROPOSED ANALYSIS · exports still use the accepted conversion",
-                );
+                ui.colored_label(GOLD, "SAVED VERSION · release compare to return to current edits");
             }
             ui.separator();
             if r.frames.is_empty() {
@@ -383,44 +430,7 @@ fn right(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     egui::ScrollArea::vertical().show(ui,|ui|{match app.panel {
         Panel::Adjust=> adjustment_panel(app, ui),
-        Panel::Conversion=>{
-            if app.busy || app.comparing { ui.disable(); }
-            ui.label(RichText::new("Guided calibration").size(18.0));
-            muted(ui,"1. Inspect the original scan for clipping and uneven lighting.");
-            if ui.button("Inspect original scan").clicked() { app.show_negative=true; app.grid=false; app.invalidate(); }
-            let r=&app.library.rolls[app.roll];
-            if let Some(warning)=r.frames.get(app.frame).and_then(|f| f.scan_warning.as_ref()) { ui.colored_label(GOLD, warning); }
-            if let Some(a)=&r.analysis {
-                ui.add_space(8.0);ui.label(RichText::new(&a.method).color(GOLD));muted(ui,format!("Shared by {} analyzed frames",a.frames));
-                ui.add_space(8.0);muted(ui,format!("Film base   {:.3} / {:.3} / {:.3}\nDensity range   {:.2}",a.base[0],a.base[1],a.base[2],a.range));
-                for warning in &a.warnings {ui.add_space(10.0);ui.label(RichText::new(warning).size(12.0).color(GOLD));}
-            }else{muted(ui,"Analyze the roll to estimate its film base and density range.");}
-            ui.add_space(16.0); muted(ui,"2. Measure a clean, unexposed film border.");
-            if ui.add_enabled(!r.frames.is_empty()&&!app.busy&&!r.conversion_locked,egui::Button::new("Select film-base patch")).clicked(){app.grid=false;app.tool=Tool::Base;app.show_negative=true;app.revision+=1;}
-            muted(ui,"Drag over clean, unexposed film. Your selection is separate from the final crop.");
-            if ui.add_enabled(r.base.is_some()&&!r.demo&&!r.conversion_locked,egui::Button::new("Use automatic base estimate")).clicked(){app.library.rolls[app.roll].base=None;app.dirty=true;app.status="Re-analyze to apply the automatic base estimate".into();}
-            ui.add_space(14.0);let r=&mut app.library.rolls[app.roll];
-            ui.collapsing("3. Analysis area",|ui|{
-                muted(ui,"Inset from all sides. Excludes holder and film border; does not crop the export.");
-                let mut inset=r.analysis_area.x;
-                if ui.add_enabled(!r.conversion_locked,egui::Slider::new(&mut inset,0.0..=0.25).text("Inset")).changed(){r.analysis_area=Rect{x:inset,y:inset,w:1.0-2.0*inset,h:1.0-2.0*inset};app.dirty=true;app.status="Re-analyze to use the changed analysis area".into();}
-            });
-            app.dirty |= ui.add_enabled(r.analysis.is_some()&&!app.busy,egui::Checkbox::new(&mut r.conversion_locked,"Lock accepted conversion")).changed();
-            muted(ui,"A lock protects the accepted calibration. New scans use it; new analysis requires your approval after unlocking.");
-            if ui.add_enabled(!app.busy&&!r.frames.is_empty(),egui::Button::new("4. Analyze / propose conversion")).clicked(){app.show_negative=false;app.actions.push(Action::Analyze);}
-            if let Some((id, a))=&app.pending_analysis {
-                if *id==r.id {
-                    ui.separator();ui.colored_label(GOLD,"Proposed calibration (not saved yet)");
-                    muted(ui,format!("{} · range {:.3}",a.method,a.range));
-                    for warning in &a.warnings {ui.colored_label(GOLD,warning);}
-                    if ui.checkbox(&mut app.preview_analysis,"Preview proposed conversion").changed(){app.show_negative=false;app.revision+=1;}
-                    if ui.add_enabled(!r.conversion_locked&&!app.busy,egui::Button::new("Accept proposed conversion")).clicked(){app.actions.push(Action::AcceptAnalysis);}
-                    if ui.button("Discard proposal").clicked(){app.actions.push(Action::DiscardAnalysis);}
-                }
-            }
-            if ui.add_enabled(r.previous_analysis.is_some()&&!app.busy&&!r.conversion_locked,egui::Button::new("Restore previous analysis")).clicked(){app.actions.push(Action::RestoreAnalysis);}
-            ui.add_space(16.0);muted(ui,"Initial density / virtual-paper model. Film-stock calibration and full-roll color consistency still need real scan validation.");
-        }
+        Panel::Conversion => conversion::panel(app, ui),
         Panel::Dust=>{
             if app.busy || app.comparing || app.preview_analysis { ui.disable(); }
             ui.label(RichText::new("Dust correction").size(18.0));muted(ui,"Only the spots you mark are changed.");ui.add_space(12.0);
@@ -597,10 +607,13 @@ fn adjustment_panel(app: &mut App, ui: &mut egui::Ui) {
             if ui.add_enabled(app.clipboard.is_some()&&!app.scope_roll,egui::Button::new(if app.scope_selected {"Paste to selected frames"} else {"Paste to this frame"})).clicked() {app.actions.push(Action::PasteEdits);}
         });
         if !app.library.rolls[app.roll].frames.is_empty() {
-            ui.collapsing("Composition · active frame only", |ui| {
-                if ui.button("Crop this frame").clicked() {app.grid=false;app.tool=Tool::Crop;app.scope_roll=false;app.scope_selected=false;app.show_negative=false;app.invalidate();}
-                if ui.button("Reset crop").clicked() {app.library.rolls[app.roll].frames[app.frame].crop=Rect::default();app.dirty=true;}
-                if ui.button("Rotate clockwise").clicked() {app.actions.push(Action::Rotate);}
+            ui.collapsing("Composition", |ui| {
+                if ui.button("Crop this frame · C").clicked() {app.actions.push(Action::Crop);}
+                if ui.button("Auto crop picture").clicked() {app.actions.push(Action::AutoCrop);}
+                if ui.button("Reset crop").clicked() {app.actions.push(Action::ResetCrop);}
+                if ui.button(if app.grid && !app.selected.is_empty() {"Rotate selected · R"} else {"Rotate clockwise · R"}).clicked() {app.actions.push(Action::Rotate);}
+                if ui.selectable_label(app.library.rolls[app.roll].frames[app.frame].mirrored,"Invert orientation (mirror)").clicked() {app.actions.push(Action::Mirror);}
+                if ui.button("Apply this orientation to whole roll").clicked() {app.actions.push(Action::OrientationToRoll);}
             });
         }
     });
@@ -785,7 +798,7 @@ fn inspector(app: &mut App, ui: &mut egui::Ui, roll: &Roll) {
                     && !app.comparing
                     && !app.preview_analysis
                     && !frame.rejected
-                    && (roll.analysis.is_some() || roll.material == Material::Positive),
+                    && (roll.analysis_for(frame).is_some() || roll.material == Material::Positive),
                 egui::Button::new("Export frame…"),
             )
             .clicked()
@@ -818,12 +831,14 @@ fn inspector(app: &mut App, ui: &mut egui::Ui, roll: &Roll) {
             };
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .selectable_label(!app.show_negative, "Positive")
             .clicked()
         {
             app.show_negative = false;
+            app.tool = Tool::View;
+            app.drag_start = None;
             app.invalidate();
         }
         if ui
@@ -831,7 +846,33 @@ fn inspector(app: &mut App, ui: &mut egui::Ui, roll: &Roll) {
             .clicked()
         {
             app.show_negative = true;
+            app.tool = Tool::View;
+            app.drag_start = None;
             app.invalidate();
+        }
+        let editable = !app.busy && !app.comparing && !app.preview_analysis;
+        if ui.add_enabled(editable, egui::Button::new("Invert orientation").selected(frame.mirrored)).on_hover_text("Mirror the positive left-to-right for a scan taken from the opposite side. Original inspection remains as captured.").clicked() {app.actions.push(Action::Mirror);}
+        if ui
+            .add_enabled(editable, egui::Button::new("Crop · C"))
+            .clicked()
+        {
+            app.actions.push(Action::Crop);
+        }
+        if ui
+            .add_enabled(editable, egui::Button::new("Auto crop"))
+            .on_hover_text("Find the picture inside the film base and straighten slight tilt")
+            .clicked()
+        {
+            app.actions.push(Action::AutoCrop);
+        }
+        if ui
+            .add_enabled(
+                editable && frame.crop != Rect::default(),
+                egui::Button::new("Reset crop"),
+            )
+            .clicked()
+        {
+            app.actions.push(Action::ResetCrop);
         }
         if ui.selectable_label(!app.zoom, "Fit").clicked() {
             app.zoom = false;
@@ -866,10 +907,10 @@ fn inspector(app: &mut App, ui: &mut egui::Ui, roll: &Roll) {
                 );
             }
             Tool::Crop => {
-                ui.colored_label(GOLD, "Drag an export crop");
+                ui.colored_label(GOLD, "Drag a crop on the original · Esc cancels");
             }
             Tool::Base => {
-                ui.colored_label(GOLD, "Drag a clean film-base patch");
+                ui.colored_label(GOLD, if app.library.rolls[app.roll].optimize_individually { format!("Drag clean, unexposed film outside the picture · {} only",frame.name) } else { "Drag a clean film-base patch · shared by this roll".into() });
             }
             Tool::View => {}
         }
@@ -894,25 +935,31 @@ fn fit(size: Vec2, available: Vec2) -> Vec2 {
     size * (available.x.max(1.0) / size.x).min(available.y.max(1.0) / size.y)
 }
 #[allow(clippy::many_single_char_names)]
-fn view_to_source(p: [f32; 2], crop: Rect, rotation: u8) -> [f32; 2] {
-    let [u, v] = p;
+fn view_to_source(p: [f32; 2], crop: Rect, rotation: u8, mirrored: bool, aspect: f32) -> [f32; 2] {
+    let [mut u, v] = p;
+    if mirrored {
+        u = 1. - u;
+    }
     let [x, y] = match rotation % 4 {
         1 => [v, 1.0 - u],
         2 => [1.0 - u, 1.0 - v],
         3 => [1.0 - v, u],
         _ => [u, v],
     };
-    [crop.x + x * crop.w, crop.y + y * crop.h]
+    crop.source_point([x, y], aspect)
 }
-fn source_to_view(p: [f32; 2], crop: Rect, rotation: u8) -> [f32; 2] {
-    let x = (p[0] - crop.x) / crop.w;
-    let y = (p[1] - crop.y) / crop.h;
-    match rotation % 4 {
+fn source_to_view(p: [f32; 2], crop: Rect, rotation: u8, mirrored: bool, aspect: f32) -> [f32; 2] {
+    let [x, y] = crop.crop_point(p, aspect);
+    let mut point = match rotation % 4 {
         1 => [1.0 - y, x],
         2 => [1.0 - x, 1.0 - y],
         3 => [y, 1.0 - x],
         _ => [x, y],
+    };
+    if mirrored {
+        point[0] = 1. - point[0];
     }
+    point
 }
 
 type GpuSettings = (
@@ -934,7 +981,13 @@ fn gpu_settings(app: &App, id: &str) -> Option<GpuSettings> {
     let frame = version
         .and_then(|v| v.state.frames.iter().find(|f| f.id == id))
         .or_else(|| roll.frames.iter().find(|f| f.id == id))?;
-    if !frame.heals.is_empty() {
+    if !frame.heals.is_empty()
+        || (roll.material != Material::Positive
+            && app
+                .displayed_conversion(roll)
+                .and_then(|a| a.for_frame(id))
+                .is_none())
+    {
         return None;
     }
     let resource = gpu.lock().unwrap();
@@ -943,9 +996,7 @@ fn gpu_settings(app: &App, id: &str) -> Option<GpuSettings> {
     {
         return None;
     }
-    let edits = version
-        .map_or(roll.adjustments, |v| v.state.adjustments)
-        .combined(frame.adjustments);
+    let edits = app.displayed_adjustments(roll, frame);
     let mut size = Vec2::new(
         (resource.width as f32 * frame.crop.w).floor().max(1.),
         (resource.height as f32 * frame.crop.h).floor().max(1.),
@@ -956,6 +1007,7 @@ fn gpu_settings(app: &App, id: &str) -> Option<GpuSettings> {
     Some((
         gpu.clone(),
         greign_gl_preview::Settings {
+            mirrored: frame.mirrored,
             edits,
             material: roll.material,
             crop: frame.crop,
@@ -978,7 +1030,10 @@ fn canvas(app: &mut App, ui: &mut egui::Ui, frame: &super::model::Frame) {
         .unwrap_or(frame)
         .clone();
     let negative = (!app.comparing && app.show_negative)
-        || (saved.map_or(roll.analysis.is_none(), |v| v.state.analysis.is_none())
+        || (app
+            .displayed_conversion(roll)
+            .and_then(|a| a.for_frame(&frame.id))
+            .is_none()
             && roll.material != Material::Positive);
     let detail = app.detail_texture.as_ref().filter(|(id, key, _)| {
         *id == frame.id && app.full_desired.as_ref() == Some(key) && !app.dragging
@@ -996,58 +1051,262 @@ fn canvas(app: &mut App, ui: &mut egui::Ui, frame: &super::model::Frame) {
         });
         return;
     };
-    ui.scope(|ui|{
-        let (viewport,response)=ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0),(ui.available_height()-12.0).max(1.0)),egui::Sense::click_and_drag());
+    ui.scope(|ui| {
+        let (viewport, response) = ui.allocate_exact_size(
+            Vec2::new(
+                ui.available_width().max(1.0),
+                (ui.available_height() - 12.0).max(1.0),
+            ),
+            egui::Sense::click_and_drag(),
+        );
         ui.set_clip_rect(viewport.intersect(ui.clip_rect()));
-        let key=serde_json::to_string(&(&frame.id,frame.crop,frame.rotation,negative)).unwrap();
-        if app.view.key!=key {app.view.fit();app.view.key=key;app.zoom=false;}
+        let key = serde_json::to_string(&(
+            &frame.id,
+            frame.crop,
+            frame.rotation,
+            frame.mirrored,
+            negative,
+        ))
+        .unwrap();
+        if app.view.key != key {
+            app.view.fit();
+            app.view.key = key;
+            app.zoom = false;
+        }
         // Use stable scan aspect, not the current low/full-resolution texture.
-        let natural=app.cache.get(&frame.id).map_or(texture.size_vec2(),|scan|{
-            let mut size=Vec2::new(scan.image.width as f32,scan.image.height as f32);
-            if !negative {size=Vec2::new(size.x*frame.crop.w,size.y*frame.crop.h);if frame.rotation%2==1 {size=Vec2::new(size.y,size.x);}}
-            size
-        });
-        let fitted=fit(natural,viewport.size());
-        if app.view.native_pending {if let Some(size)=full_size {app.view.scale=(size.x/ui.ctx().pixels_per_point()/fitted.x).clamp(1.0,32.0);app.view.native_pending=false;}}
-        if response.hovered() {
-            let (factor,pointer,scroll,command)=ui.input(|i|(i.zoom_delta(),i.pointer.hover_pos(),i.smooth_scroll_delta,i.modifiers.command||i.modifiers.ctrl||i.modifiers.mac_cmd));
-            if let Some(pointer)=pointer {if (factor-1.0).abs()>0.00001 {app.view.zoom_at(factor,pointer,viewport,fitted);app.zoom=app.view.scale>1.0;app.refine=true;app.scheduled=None;}}
-            if !command {app.view.pan+=scroll;}
-        }
-        if response.dragged_by(egui::PointerButton::Middle)||(app.tool==Tool::View&&response.dragged_by(egui::PointerButton::Primary)) {app.view.pan+=ui.input(|i|i.pointer.delta());}
-        app.view.clamp(viewport,fitted);
-        app.view.percent=full_size.map(|size|app.view.scale*fitted.x*ui.ctx().pixels_per_point()/size.x*100.);
-        let rect=app.view.rect(viewport,fitted);
-        if let Some((gpu,settings,_))=&gpu {ui.painter().add(greign_gl_preview::Preview::callback(gpu.clone(),rect,*settings));}
-        else {ui.painter().image(texture.id(),rect,egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE);}
-        let source_crop=if negative {Rect::default()} else {frame.crop};
-        let source_rotation=if negative {0} else {frame.rotation};
-        let to_source=|pos:egui::Pos2|view_to_source([((pos.x-rect.left())/rect.width()).clamp(0.0,1.0),((pos.y-rect.top())/rect.height()).clamp(0.0,1.0)],source_crop,source_rotation);
-        if app.tool==Tool::Neutral&&!negative&&!app.busy&&!app.comparing&&!app.preview_analysis&&response.clicked() {
-            if let Some(pos)=response.interact_pointer_pos().filter(|p|rect.contains(*p)) {app.pick_neutral(to_source(pos),ui.ctx());}
-        }
-        if app.tool==Tool::Heal&&!app.show_negative&&!app.comparing&&!app.preview_analysis&&!app.busy {
-            for (i,heal) in frame.heals.iter().enumerate(){let point=source_to_view(heal.target,frame.crop,frame.rotation);
-                let pos=egui::pos2(rect.left()+point[0]*rect.width(),rect.top()+point[1]*rect.height());
-                let r=heal.radius*rect.width().min(rect.height())/frame.crop.w.min(frame.crop.h);
-                ui.painter().circle_stroke(pos,r,Stroke::new(1.2,GOLD));
-                if app.selected_heal==Some(i){let point=source_to_view(heal.source,frame.crop,frame.rotation);let source=egui::pos2(rect.left()+point[0]*rect.width(),rect.top()+point[1]*rect.height());
-                    ui.painter().circle_stroke(source,r,Stroke::new(1.2,Color32::LIGHT_BLUE));ui.painter().line_segment([pos,source],Stroke::new(1.0,GOLD));}
+        let natural = app
+            .cache
+            .get(&frame.id)
+            .map_or(texture.size_vec2(), |scan| {
+                let mut size = Vec2::new(scan.image.width as f32, scan.image.height as f32);
+                if !negative {
+                    size = Vec2::new(size.x * frame.crop.w, size.y * frame.crop.h);
+                    if frame.rotation % 2 == 1 {
+                        size = Vec2::new(size.y, size.x);
+                    }
+                }
+                size
+            });
+        let fitted = fit(natural, viewport.size());
+        if app.view.native_pending {
+            if let Some(size) = full_size {
+                app.view.scale = (size.x / ui.ctx().pixels_per_point() / fitted.x).clamp(1.0, 32.0);
+                app.view.native_pending = false;
             }
-            if response.clicked(){if let Some(pos)=response.interact_pointer_pos().filter(|p|rect.contains(*p)){let target=to_source(pos);let f=&mut app.library.rolls[app.roll].frames[app.frame];
-                if app.move_source {if let Some(i)=app.selected_heal.filter(|i|*i<f.heals.len()){f.heals[i].source=target;app.dirty=true;}app.move_source=false;}
-                else {f.heals.push(Heal{target,source:film::suggest_source(target,app.dust_radius,texture.aspect_ratio()),radius:app.dust_radius});app.selected_heal=Some(f.heals.len()-1);app.dirty=true;}
-            }}
         }
-        if (app.tool==Tool::Crop||app.tool==Tool::Base)&&!app.comparing&&!app.preview_analysis&&!app.busy&&(app.tool!=Tool::Base||!app.library.rolls[app.roll].conversion_locked) {
-            if response.drag_started(){app.drag_start=ui.input(|i|i.pointer.press_origin());}
-            if let (Some(start),Some(end))=(app.drag_start,response.interact_pointer_pos()){
-                ui.painter().rect_stroke(egui::Rect::from_two_pos(start,end),0.0,Stroke::new(1.5,GOLD),egui::StrokeKind::Inside);
-                if response.drag_stopped(){let a=to_source(start);let b=to_source(end);let region=Rect{x:a[0].min(b[0]),y:a[1].min(b[1]),w:(a[0]-b[0]).abs(),h:(a[1]-b[1]).abs()};
-                    if region.valid()&&region.w>0.005&&region.h>0.005 {
-                        if app.tool==Tool::Crop {app.library.rolls[app.roll].frames[app.frame].crop=region;app.dirty=true;}
-                        else if let Some(scan)=app.cache.get(&frame.id){match film::measure_base(scan,region){Ok(base)=>{app.library.rolls[app.roll].base=Some(base);app.dirty=true;app.status="Film-base patch selected. Re-analyze & convert to apply it.".into();}Err(e)=>app.status=e.to_string()}}
-                    }app.drag_start=None;app.tool=Tool::View;
+        if response.hovered() {
+            let (factor, pointer, scroll, command) = ui.input(|i| {
+                (
+                    i.zoom_delta(),
+                    i.pointer.hover_pos(),
+                    i.smooth_scroll_delta,
+                    i.modifiers.command || i.modifiers.ctrl || i.modifiers.mac_cmd,
+                )
+            });
+            if let Some(pointer) = pointer {
+                if (factor - 1.0).abs() > 0.00001 {
+                    app.view.zoom_at(factor, pointer, viewport, fitted);
+                    app.zoom = app.view.scale > 1.0;
+                    app.refine = true;
+                    app.scheduled = None;
+                }
+            }
+            if !command {
+                app.view.pan += scroll;
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Middle)
+            || (app.tool == Tool::View && response.dragged_by(egui::PointerButton::Primary))
+        {
+            app.view.pan += ui.input(|i| i.pointer.delta());
+        }
+        app.view.clamp(viewport, fitted);
+        app.view.percent = full_size
+            .map(|size| app.view.scale * fitted.x * ui.ctx().pixels_per_point() / size.x * 100.);
+        let rect = app.view.rect(viewport, fitted);
+        if let Some((gpu, settings, _)) = &gpu {
+            ui.painter().add(greign_gl_preview::Preview::callback(
+                gpu.clone(),
+                rect,
+                *settings,
+            ));
+        } else {
+            ui.painter().image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        let aspect = app.cache.get(&frame.id).map_or(1., |scan| {
+            scan.image.width as f32 / scan.image.height as f32
+        });
+        let source_crop = if negative {
+            Rect::default()
+        } else {
+            frame.crop
+        };
+        let source_rotation = if negative { 0 } else { frame.rotation };
+        let to_source = |pos: egui::Pos2| {
+            view_to_source(
+                [
+                    ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                    ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                ],
+                source_crop,
+                source_rotation,
+                !negative && frame.mirrored,
+                aspect,
+            )
+        };
+        if app.tool == Tool::Crop && negative && frame.crop != Rect::default() {
+            let corners = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]].map(|p| {
+                let p = frame.crop.source_point(p, aspect);
+                egui::pos2(
+                    rect.left() + p[0] * rect.width(),
+                    rect.top() + p[1] * rect.height(),
+                )
+            });
+            for i in 0..4 {
+                ui.painter()
+                    .line_segment([corners[i], corners[(i + 1) % 4]], Stroke::new(1.5, GOLD));
+            }
+        }
+        if app.tool == Tool::Neutral
+            && !negative
+            && !app.busy
+            && !app.comparing
+            && !app.preview_analysis
+            && response.clicked()
+        {
+            if let Some(pos) = response
+                .interact_pointer_pos()
+                .filter(|p| rect.contains(*p))
+            {
+                app.pick_neutral(to_source(pos), ui.ctx());
+            }
+        }
+        if app.tool == Tool::Heal
+            && !app.show_negative
+            && !app.comparing
+            && !app.preview_analysis
+            && !app.busy
+        {
+            for (i, heal) in frame.heals.iter().enumerate() {
+                let point = source_to_view(
+                    heal.target,
+                    frame.crop,
+                    frame.rotation,
+                    frame.mirrored,
+                    aspect,
+                );
+                let pos = egui::pos2(
+                    rect.left() + point[0] * rect.width(),
+                    rect.top() + point[1] * rect.height(),
+                );
+                let r =
+                    heal.radius * rect.width().min(rect.height()) / frame.crop.w.min(frame.crop.h);
+                ui.painter().circle_stroke(pos, r, Stroke::new(1.2, GOLD));
+                if app.selected_heal == Some(i) {
+                    let point = source_to_view(
+                        heal.source,
+                        frame.crop,
+                        frame.rotation,
+                        frame.mirrored,
+                        aspect,
+                    );
+                    let source = egui::pos2(
+                        rect.left() + point[0] * rect.width(),
+                        rect.top() + point[1] * rect.height(),
+                    );
+                    ui.painter()
+                        .circle_stroke(source, r, Stroke::new(1.2, Color32::LIGHT_BLUE));
+                    ui.painter()
+                        .line_segment([pos, source], Stroke::new(1.0, GOLD));
+                }
+            }
+            if response.clicked() {
+                if let Some(pos) = response
+                    .interact_pointer_pos()
+                    .filter(|p| rect.contains(*p))
+                {
+                    let target = to_source(pos);
+                    let f = &mut app.library.rolls[app.roll].frames[app.frame];
+                    if app.move_source {
+                        if let Some(i) = app.selected_heal.filter(|i| *i < f.heals.len()) {
+                            f.heals[i].source = target;
+                            app.dirty = true;
+                        }
+                        app.move_source = false;
+                    } else {
+                        f.heals.push(Heal {
+                            target,
+                            source: film::suggest_source(
+                                target,
+                                app.dust_radius,
+                                texture.aspect_ratio(),
+                            ),
+                            radius: app.dust_radius,
+                        });
+                        app.selected_heal = Some(f.heals.len() - 1);
+                        app.dirty = true;
+                    }
+                }
+            }
+        }
+        if (app.tool == Tool::Crop || app.tool == Tool::Base)
+            && !app.comparing
+            && !app.preview_analysis
+            && !app.busy
+            && (app.tool != Tool::Base || !app.library.rolls[app.roll].conversion_locked)
+        {
+            if response.drag_started() {
+                app.drag_start = ui
+                    .input(|i| i.pointer.press_origin())
+                    .filter(|p| rect.contains(*p));
+            }
+            if let (Some(start), Some(end)) = (app.drag_start, response.interact_pointer_pos()) {
+                ui.painter().rect_stroke(
+                    egui::Rect::from_two_pos(start, end),
+                    0.0,
+                    Stroke::new(1.5, GOLD),
+                    egui::StrokeKind::Inside,
+                );
+                if response.drag_stopped() {
+                    let a = to_source(start);
+                    let b = to_source(end);
+                    let region = Rect {
+                        x: a[0].min(b[0]),
+                        y: a[1].min(b[1]),
+                        w: (a[0] - b[0]).abs(),
+                        h: (a[1] - b[1]).abs(),
+                        angle: 0.0,
+                    };
+                    if region.valid() && region.w > 0.005 && region.h > 0.005 {
+                        if app.tool == Tool::Crop {
+                            app.library.rolls[app.roll].frames[app.frame].crop = region;
+                            app.dirty = true;
+                            app.status = "Crop applied · Undo restores the previous crop".into();
+                        } else if let Some(scan) = app.cache.get(&frame.id) {
+                            match film::measure_base(scan, region) {
+                                Ok(base) => {
+                                    app.actions.push(Action::SetBase {
+                                        frame: app.library.rolls[app.roll]
+                                            .optimize_individually
+                                            .then_some(app.frame),
+                                        base: Some(base),
+                                    });
+                                }
+                                Err(e) => app.status = e.to_string(),
+                            }
+                        }
+                    }
+                    if app.tool == Tool::Crop {
+                        app.show_negative = app.crop_return_negative;
+                        app.invalidate();
+                    }
+                    app.drag_start = None;
+                    app.tool = Tool::View;
                 }
             }
         }
@@ -1058,37 +1317,44 @@ fn dialogs(app: &mut App, ctx: &egui::Context) {
     if app.new_roll_open {
         let mut open = true;
         let mut create = false;
-        egui::Window::new("Import a roll").open(&mut open).collapsible(false).resizable(false).default_width(410.0).show(ctx,|ui|{
-            ui.label("Give this roll a home.");ui.add_space(8.0);ui.label("Roll name");ui.text_edit_singleline(&mut app.new_name);
-            ui.label("Film stock (optional)");ui.text_edit_singleline(&mut app.new_stock);
-            ui.horizontal(|ui|{ui.selectable_value(&mut app.new_material,Material::ColorNegative,"Color negative");ui.selectable_value(&mut app.new_material,Material::BlackAndWhite,"B&W");ui.selectable_value(&mut app.new_material,Material::Positive,"Positive");});
-            muted(ui,"Choose all scans in the next dialog. Original files remain in place and are never modified.");
-            create=primary(ui,"Create roll & choose scans").clicked();
+        egui::Window::new("Import a roll").open(&mut open).collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label("Choose the folder containing this roll's scans.");
+            ui.horizontal(|ui| {
+                if primary(ui, "Choose roll folder…").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().set_title("Choose a roll folder").pick_folder() {
+                        app.choose_import_folder(folder);
+                    }
+                }
+                if ui.button("Choose individual files…").clicked() {
+                    if let Some(mut paths) = rfd::FileDialog::new().add_filter("Scans", &["cr3", "CR3", "cr2", "nef", "arw", "dng", "orf", "rw2", "raf", "tif", "tiff", "jpg", "jpeg", "png"]).pick_files() {
+                        paths.retain(|p| p.is_file() && super::model::supported(p));
+                        paths.sort(); paths.dedup();
+                        if app.new_name.trim().is_empty() {
+                            app.new_name = paths.first().and_then(|p| p.parent()).map(super::workflow::folder_name).unwrap_or_default();
+                        }
+                        app.new_paths = paths;
+                        app.new_folder = None;
+                        app.new_import_error = None;
+                    }
+                }
+            });
+            if let Some(folder) = &app.new_folder { ui.label(folder.display().to_string()); }
+            ui.label(format!("{} scans selected", app.new_paths.len()));
+            if let Some(error) = &app.new_import_error { ui.colored_label(Color32::LIGHT_RED, error); }
+            ui.add_space(8.0);
+            ui.label("Roll name"); ui.text_edit_singleline(&mut app.new_name);
+            ui.label("Film stock (optional)"); ui.text_edit_singleline(&mut app.new_stock);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut app.new_material, Material::ColorNegative, "Color negative");
+                ui.selectable_value(&mut app.new_material, Material::BlackAndWhite, "B&W");
+                ui.selectable_value(&mut app.new_material, Material::Positive, "Positive");
+            });
+            muted(ui, "Imports image files directly inside the folder. Subfolders are separate rolls. Originals stay in place.");
+            create = ui.add_enabled(!app.busy && !app.new_paths.is_empty() && app.new_import_error.is_none(), egui::Button::new(RichText::new("Import roll").color(BG)).fill(GOLD)).clicked();
         });
         app.new_roll_open = open;
         if create {
-            let before = app.library.clone();
-            let mut r = Roll::new(if app.new_name.trim().is_empty() {
-                "Untitled roll"
-            } else {
-                app.new_name.trim()
-            });
-            r.stock.clone_from(&app.new_stock);
-            r.material = app.new_material;
-            app.library.rolls.push(r);
-            app.roll = app.library.rolls.len() - 1;
-            app.frame = 0;
-            app.selected.clear();
-            app.scope_selected = false;
-            app.version_index = 0;
-            app.pending_analysis = None;
-            app.preview_analysis = false;
-            app.new_roll_open = false;
-            app.new_name.clear();
-            app.new_stock.clear();
-            app.remember(before);
-            app.save();
-            app.actions.push(Action::Import);
+            app.import_new_roll(ctx);
         }
     }
     if app.metadata_open {
@@ -1119,63 +1385,18 @@ fn dialogs(app: &mut App, ctx: &egui::Context) {
             });
         app.metadata_open = open;
     }
-    if app.export_dialog {
-        let mut open = true;
-        let mut export = false;
-        egui::Window::new("Export frames").open(&mut open).collapsible(false).default_width(450.0).show(ctx,|ui|{
-        let r=&mut app.library.rolls[app.roll];
-        ui.horizontal_wrapped(|ui|{
-            ui.selectable_value(&mut app.export_scope,super::ExportScope::Roll,"Whole roll");
-            ui.selectable_value(&mut app.export_scope,super::ExportScope::Selected,"Selected frames");
-            ui.selectable_value(&mut app.export_scope,super::ExportScope::Frame,"Active frame");
-        });
-        let count=r.frames.iter().enumerate().filter(|(i,f)|!f.rejected&&match app.export_scope {super::ExportScope::Roll=>true,super::ExportScope::Selected=>app.selected.contains(&f.id),super::ExportScope::Frame=>*i==app.frame}).count();
-        ui.label(format!("{count} kept frames to export"));
-        let date_valid=match greign_export::CaptureDate::parse(&r.date) {
-            Ok(Some(date))=>{ui.label(format!("Capture date: {}",date.as_exif()));true},
-            Ok(None)=>{ui.label("No roll date set · capture date will be omitted");true},
-            Err(error)=>{ui.colored_label(Color32::LIGHT_RED,error);false},
-        };
-        ui.horizontal(|ui|{
-            if ui.button("Full JPEG · quality 95").clicked(){r.export.dng=false;r.export.tiff=false;r.export.long_edge=0;r.export.jpeg_quality=95;app.dirty=true;}
-            if ui.button("Full TIFF").clicked(){r.export.dng=false;r.export.tiff=true;r.export.long_edge=0;app.dirty=true;}
-            if ui.button("Share JPEG · 2048 px").clicked(){r.export.dng=false;r.export.tiff=false;r.export.long_edge=2048;r.export.jpeg_quality=90;app.dirty=true;}
-        });
-        for preset in r.export_presets.clone() {if ui.button(format!("Use {}",preset.name)).clicked(){r.export=preset;app.dirty=true;}}
-        ui.horizontal_wrapped(|ui|{
-            if ui.selectable_label(!r.export.dng&&!r.export.tiff,"JPEG").clicked(){r.export.dng=false;r.export.tiff=false;app.dirty=true;}
-            if ui.selectable_label(!r.export.dng&&r.export.tiff,"TIFF · 16-bit ZIP").clicked(){r.export.dng=false;r.export.tiff=true;app.dirty=true;}
-            if ui.selectable_label(r.export.dng,"DNG · linear 32-bit float").clicked(){r.export.dng=true;r.export.tiff=false;app.dirty=true;}
-        });
-        if r.export.dng {muted(ui,"Full-resolution edited positive in linear Rec.2020. Conversion, adjustments, crop and healing are baked in. Not original camera RAW. Large uncompressed files; other editors may apply a different initial look. Lightroom import still needs validation.");}
-        if !r.export.dng && !r.export.tiff {
-            app.dirty|=ui.add(egui::Slider::new(&mut r.export.jpeg_quality,1..=100).text("JPEG quality")).changed();
-            muted(ui,"95 keeps fine detail; 90 is a smaller sharing copy. Quality 100 is still lossy and can produce much larger files. Full JPEG stays at quality 95 unless you change it.");
-        }
-        ui.label("Longest edge in pixels (0 = full resolution)");
-        app.dirty|=ui.add_enabled(!r.export.dng,egui::DragValue::new(&mut r.export.long_edge).range(0..=32000)).changed();
-        ui.label("Filename prefix (letters, numbers, dash, underscore)");app.dirty|=ui.text_edit_singleline(&mut r.export.prefix).changed();
-        let destination=r.export.destination.as_ref().unwrap_or(&app.export_dir);
-        ui.label(destination.display().to_string());if ui.button("Choose destination…").clicked(){if let Some(path)=rfd::FileDialog::new().set_directory(destination).pick_folder(){r.export.destination=Some(path);app.dirty=true;}}
-        ui.label("Preset name");app.dirty|=ui.text_edit_singleline(&mut r.export.name).changed();
-        if ui.add_enabled(!r.export.name.trim().is_empty(),egui::Button::new("Save / update preset for this roll")).clicked(){r.export_presets.retain(|p|p.name!=r.export.name);r.export_presets.push(r.export.clone());app.dirty=true;}
-        muted(ui,"Ctrl+E opens this dialog. Settings are remembered. Each export gets a new folder and recipe. If a frame fails, retry only failed frames with the same frozen settings.");
-        export=ui.add_enabled(date_valid&&count>0&&!app.busy&&!app.preview_analysis&&!app.comparing,egui::Button::new("Export kept frames")).clicked();
-    });
-        app.export_dialog = open;
-        if export {
-            app.export_dialog = false;
-            app.actions.push(Action::Export);
-        }
+    if app.export_dialog && !app.library.rolls.is_empty() {
+        export_dialog(app, ctx);
     }
-    if let Some(retry) = &app.export_retry {
+    if !app.export_retry.is_empty() {
         let mut retry_now = false;
-        egui::Window::new("Export needs attention").show(ctx,|ui|{
-            ui.label(format!("{} frames failed. Successful exports are already saved.",retry.ids.len()));
-            ui.label(&app.status);
-            for frame in &retry.roll.frames {if retry.ids.contains(&frame.id){ui.label(&frame.name);}}
-            muted(ui,"Restore missing files or resolve the destination problem, then retry. Uses the original export settings, even if you have edited the roll since.");
-            retry_now=ui.add_enabled(!app.busy,egui::Button::new("Retry failed frames only")).clicked();
+        egui::Window::new("Export needs attention").show(ctx, |ui| {
+            for retry in &app.export_retry {
+                ui.label(format!("{} · {} failed frames", retry.roll.name, retry.ids.len()));
+                for frame in &retry.roll.frames { if retry.ids.contains(&frame.id) { ui.label(&frame.name); } }
+            }
+            muted(ui, "Successful exports are saved. Restore missing files or resolve the destination problem, then retry with the original frozen settings.");
+            retry_now = ui.add_enabled(!app.busy, egui::Button::new("Retry failed frames only")).clicked();
         });
         if retry_now {
             app.actions.push(Action::RetryExport);
@@ -1183,9 +1404,286 @@ fn dialogs(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+fn export_dialog(app: &mut App, ctx: &egui::Context) {
+    use super::ExportScope;
+    let mut open = true;
+    let mut export = false;
+    let mut defaults = None;
+    let batch = app.export_scope == ExportScope::AllReady;
+    egui::Window::new(if batch { "Export ready rolls" } else { "Export frames" }).open(&mut open).collapsible(false).default_size([520.0, 600.0]).max_height((ctx.screen_rect().height() - 100.0).max(300.0)).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).vscroll(true).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        let (count, ready) = if batch {
+            let readiness: Vec<_> = app.library.rolls.iter().map(|roll| super::workflow::export_ready(roll, None)).collect();
+            let count: usize = readiness.iter().filter_map(|r| r.as_ref().ok()).sum();
+            let rolls = readiness.iter().filter(|r| r.is_ok()).count();
+            egui::CollapsingHeader::new("Rolls in this batch").default_open(true).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("batch-roll-list").max_height(120.0).show(ui, |ui| {
+                for (roll, result) in app.library.rolls.iter().zip(&readiness) {
+                    match result {
+                        Ok(frames) => { ui.label(format!("{} · {frames} frames", roll.name)); }
+                        Err(error) => { muted(ui, format!("Skipped: {} · {error}", roll.name)); }
+                    }
+                }
+            });
+            });
+            ui.label(format!("{rolls} ready rolls · {count} kept frames · {} skipped", app.library.rolls.len() - rolls));
+            (count, rolls > 0)
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut app.export_scope, ExportScope::Roll, "Whole roll");
+                ui.selectable_value(&mut app.export_scope, ExportScope::Selected, "Selected frames");
+                ui.selectable_value(&mut app.export_scope, ExportScope::Frame, "Active frame");
+            });
+            let roll = &app.library.rolls[app.roll];
+            let only = match app.export_scope {
+                ExportScope::Selected => Some(app.selected.clone()),
+                ExportScope::Frame => Some(roll.frames.get(app.frame).map(|f| f.id.clone()).into_iter().collect()),
+                _ => None,
+            };
+            match super::workflow::export_ready(roll, only.as_ref()) {
+                Ok(count) => { ui.label(format!("{count} kept frames to export")); (count, true) }
+                Err(error) => { ui.colored_label(Color32::LIGHT_RED, error.to_string()); (0, false) }
+            }
+        };
+        let example_roll = if batch {
+            app.library.rolls.iter().find(|roll| super::workflow::export_ready(roll, None).is_ok()).unwrap_or(&app.library.rolls[app.roll])
+        } else { &app.library.rolls[app.roll] };
+        let roll_name = example_roll.name.clone();
+        let preset = if batch { &mut app.library.export_defaults } else { &mut app.library.rolls[app.roll].export };
+        ui.separator();
+        ui.label("Master export folder");
+        let destination = preset.destination.as_ref().unwrap_or(&app.export_dir);
+        ui.label(destination.display().to_string());
+        if ui.button("Choose master folder…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().set_directory(destination).pick_folder() { preset.destination = Some(path); app.dirty = true; }
+        }
+        ui.label("Roll folder suffix");
+        app.dirty |= ui.text_edit_singleline(&mut preset.folder_suffix).changed();
+        let destination = preset.destination.as_ref().unwrap_or(&app.export_dir);
+        let folder = super::workflow::export_folder_name(&roll_name, &preset.folder_suffix);
+        ui.label(format!("{}: {}", if batch { "Example" } else { "Saves to" }, destination.join(folder).display()));
+        muted(ui, "Each roll gets its own folder. Existing folders are preserved; repeats add (2), (3), …");
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Full JPEG · quality 95").clicked() { preset.dng = false; preset.tiff = false; preset.long_edge = 0; preset.jpeg_quality = 95; app.dirty = true; }
+            if ui.button("Full TIFF").clicked() { preset.dng = false; preset.tiff = true; preset.long_edge = 0; app.dirty = true; }
+            if ui.button("Share JPEG · 2048 px").clicked() { preset.dng = false; preset.tiff = false; preset.long_edge = 2048; preset.jpeg_quality = 90; app.dirty = true; }
+        });
+        let format = if preset.dng { "DNG" } else if preset.tiff { "TIFF" } else { "JPEG" };
+        let size = if preset.dng || preset.long_edge == 0 { "Full resolution".into() } else { format!("{} px longest edge", preset.long_edge) };
+        let quality = if preset.dng || preset.tiff { String::new() } else { format!(" · quality {}", preset.jpeg_quality) };
+        ui.label(format!("{format} · {size}{quality}"));
+        egui::CollapsingHeader::new("More export options").show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(!preset.dng && !preset.tiff, "JPEG").clicked() { preset.dng = false; preset.tiff = false; app.dirty = true; }
+            if ui.selectable_label(!preset.dng && preset.tiff, "TIFF · 16-bit ZIP").clicked() { preset.dng = false; preset.tiff = true; app.dirty = true; }
+            if ui.selectable_label(preset.dng, "DNG · linear 32-bit float").clicked() { preset.dng = true; preset.tiff = false; app.dirty = true; }
+        });
+        if preset.dng { muted(ui, "Full-resolution edited positive in linear Rec.2020. Edits are baked in. Large uncompressed files; other editors may apply a different initial look. Lightroom import still needs validation."); }
+        if !preset.dng && !preset.tiff { app.dirty |= ui.add(egui::Slider::new(&mut preset.jpeg_quality, 1..=100).text("JPEG quality")).changed(); }
+        ui.horizontal(|ui| {
+            ui.label("Longest edge (0 = full resolution)");
+            app.dirty |= ui.add_enabled(!preset.dng, egui::DragValue::new(&mut preset.long_edge).range(0..=32000)).changed();
+        });
+        ui.label("Filename prefix (optional)"); app.dirty |= ui.text_edit_singleline(&mut preset.prefix).changed();
+        });
+        if ui.button("Use these settings for every roll").clicked() {
+            let mut saved = preset.clone();
+            // Remember even the platform's default destination for one-click export.
+            if saved.destination.is_none() { saved.destination = Some(app.export_dir.clone()); }
+            defaults = Some(saved);
+        }
+        muted(ui, "Applies to existing and future rolls. Export roll then uses these settings in one click.");
+        if !batch {
+            let r = &mut app.library.rolls[app.roll];
+            egui::CollapsingHeader::new("Presets for this roll").show(ui, |ui| {
+                for preset in r.export_presets.clone() { if ui.button(format!("Use {}", preset.name)).clicked() { r.export = preset; app.dirty = true; } }
+                ui.label("Preset name"); app.dirty |= ui.text_edit_singleline(&mut r.export.name).changed();
+                if ui.add_enabled(!r.export.name.trim().is_empty(), egui::Button::new("Save / update preset for this roll")).clicked() {
+                    r.export_presets.retain(|p| p.name != r.export.name); r.export_presets.push(r.export.clone()); app.dirty = true;
+                }
+            });
+        }
+        ui.separator();
+        export = ui.add_enabled(ready && count > 0 && !app.busy && !app.preview_analysis && !app.comparing, egui::Button::new(RichText::new(if batch { "Export all ready rolls" } else { "Export kept frames" }).color(BG)).fill(GOLD)).clicked();
+    });
+    if let Some(preset) = defaults {
+        app.set_export_defaults(preset);
+    }
+    app.export_dialog = open;
+    if export {
+        app.export_dialog = false;
+        app.actions.push(Action::Export);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_import_and_batch_export_dialogs_show_destinations_and_skipped_rolls() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            directory.path().into(),
+            super::super::model::Library::default(),
+            None,
+        );
+        let mut roll = Roll::new("Kyoto 2026");
+        roll.material = Material::Positive;
+        roll.frames
+            .push(super::super::model::Frame::new("scan.png".into()));
+        app.library.rolls = vec![roll, Roll::new("Unconverted")];
+        app.new_roll_open = true;
+        let render = |app: &mut App, width, height| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| draw(app, ctx),
+            )
+        };
+        let labels = |output: &egui::FullOutput| -> Vec<String> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (width, height) in [(1080., 720.), (1440., 960.)] {
+            // egui settles window sizing after the first frame.
+            render(&mut app, width, height);
+            let texts = labels(&render(&mut app, width, height));
+            assert!(texts.iter().any(|s| s == "Choose roll folder…"));
+            assert!(texts.iter().any(|s| s == "Import roll"));
+        }
+        app.new_roll_open = false;
+        app.roll = 1; // The batch example must name a roll that will actually be exported.
+        app.export_scope = super::super::ExportScope::AllReady;
+        app.export_dialog = true;
+        for (width, height) in [(1080., 720.), (1440., 960.)] {
+            render(&mut app, width, height);
+            let texts = labels(&render(&mut app, width, height));
+            for label in [
+                "Master export folder",
+                "Roll folder suffix",
+                "Use these settings for every roll",
+                "Export all ready rolls",
+            ] {
+                assert!(
+                    texts.iter().any(|s| s == label),
+                    "Missing {label}: {texts:?}"
+                );
+            }
+            assert!(texts.iter().any(|s| s.contains("Kyoto 2026 - converted")));
+            assert!(texts.iter().any(|s| s.contains("Skipped: Unconverted")));
+        }
+    }
+
+    #[test]
+    fn crop_drag_can_expand_an_existing_rotated_crop_on_the_full_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            dir.path().to_owned(),
+            super::super::model::Library::default(),
+            None,
+        );
+        let mut roll = Roll::new("Crop");
+        let mut frame = super::super::model::Frame::new("scan.png".into());
+        frame.crop = Rect {
+            x: 0.4,
+            y: 0.4,
+            w: 0.2,
+            h: 0.2,
+            angle: 2.5,
+        };
+        frame.rotation = 1;
+        frame.mirrored = true;
+        let texture = ctx.load_texture(
+            "crop-fixture",
+            egui::ColorImage::new([300, 200], Color32::GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        let texture_id = texture.id();
+        app.textures.insert(frame.id.clone(), texture);
+        roll.frames.push(frame);
+        app.library.rolls.push(roll);
+        app.apply_action(Action::Crop, &ctx);
+        app.apply_action(Action::Crop, &ctx);
+        assert!(app.show_negative);
+        let run = |app: &mut App, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let frame = app.library.rolls[0].frames[0].clone();
+                    egui::CentralPanel::default().show(ctx, |ui| canvas(app, ui, &frame));
+                },
+            )
+        };
+        let output = run(&mut app, vec![]);
+        let rect = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id => {
+                    Some(mesh.calc_bounds())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let a = rect.min + rect.size() * 0.2;
+        let b = rect.min + rect.size() * 0.8;
+        run(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(a),
+                egui::Event::PointerButton {
+                    pos: a,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        run(&mut app, vec![egui::Event::PointerMoved(b)]);
+        run(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: b,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        let frame = &app.library.rolls[0].frames[0];
+        assert!((frame.crop.x - 0.2).abs() < 0.001);
+        assert!((frame.crop.y - 0.2).abs() < 0.001);
+        assert!((frame.crop.w - 0.6).abs() < 0.001);
+        assert!((frame.crop.h - 0.6).abs() < 0.001);
+        assert_eq!(frame.rotation, 1);
+        assert!(frame.crop.angle.abs() < f32::EPSILON);
+        assert!(frame.mirrored);
+        assert!(!app.show_negative);
+        assert!(app.dirty && app.drag_start.is_none() && app.tool == Tool::View);
+    }
+
     #[test]
     fn opening_mixer_exposes_all_eight_color_groups() {
         let dir = tempfile::tempdir().unwrap();
@@ -1313,6 +1811,77 @@ mod tests {
         assert!((ctx.pixels_per_point() - scale).abs() < 1e-6);
     }
     #[test]
+    fn roll_crop_and_mirror_controls_are_visible_and_clickable_above_the_contact_sheet() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            directory.path().to_owned(),
+            super::super::model::Library::default(),
+            None,
+        );
+        let mut roll = Roll::new("Roll tools");
+        roll.material = Material::Positive;
+        roll.frames = ["one.png", "two.png"]
+            .map(|name| super::super::model::Frame::new(name.into()))
+            .to_vec();
+        roll.frames[0].mirrored = true;
+        app.library.rolls.push(roll);
+        let run = |app: &mut App, events, width| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 960.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| draw(app, ctx),
+            )
+        };
+        for width in [1080., 1440.] {
+            let output = run(&mut app, vec![], width);
+            for label in ["Autocrop all frames", "Auto upright", "Mirror all frames"] {
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .expect("Roll controls should be visible without opening an expander");
+                assert!(position.y < 350.);
+                app.actions.clear();
+                for pressed in [true, false] {
+                    run(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                        width,
+                    );
+                }
+                assert!(app.actions.iter().any(|action| matches!(
+                    (label, action),
+                    ("Autocrop all frames", Action::AutoCropAll)
+                        | ("Auto upright", Action::AutoUpright)
+                        | ("Mirror all frames", Action::MirrorAll(true))
+                )));
+                assert!(app.grid);
+            }
+        }
+    }
+
+    #[test]
     fn native_widgets_accept_headless_pointer_input_and_panels_draw() {
         let directory = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
@@ -1384,12 +1953,15 @@ mod tests {
             y: 0.1,
             w: 0.6,
             h: 0.7,
+            angle: -2.5,
         };
         for rotation in 0..4 {
-            let p = [0.35, 0.63];
-            let v = source_to_view(p, crop, rotation);
-            let out = view_to_source(v, crop, rotation);
-            assert!((p[0] - out[0]).abs() < 0.00001 && (p[1] - out[1]).abs() < 0.00001);
+            for mirrored in [false, true] {
+                let p = [0.35, 0.63];
+                let v = source_to_view(p, crop, rotation, mirrored, 1.5);
+                let out = view_to_source(v, crop, rotation, mirrored, 1.5);
+                assert!((p[0] - out[0]).abs() < 0.00001 && (p[1] - out[1]).abs() < 0.00001);
+            }
         }
     }
 }

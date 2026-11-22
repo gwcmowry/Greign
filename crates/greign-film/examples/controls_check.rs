@@ -47,6 +47,7 @@ fn main() -> anyhow::Result<()> {
                 edits,
                 Rect::default(),
                 0,
+                false,
                 &[],
                 false,
             )?;
@@ -59,6 +60,7 @@ fn main() -> anyhow::Result<()> {
                     edits,
                     Rect::default(),
                     0,
+                    false,
                     &[],
                     false,
                 )?);

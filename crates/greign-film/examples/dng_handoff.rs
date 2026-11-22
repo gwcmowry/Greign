@@ -51,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         Adjustments::default(),
         Rect::default(),
         0,
+        false,
         &[],
         false,
     )?;

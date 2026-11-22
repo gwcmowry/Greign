@@ -1,7 +1,8 @@
-use crate::model::Roll;
+use crate::model::{Conversion, Roll};
 use greign_film::{self as film, Analysis, Scan};
+use rayon::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Sender},
@@ -9,6 +10,8 @@ use std::{
 };
 
 pub enum Event {
+    AutoOriented(String, Result<OrientationBatch, String>),
+    AutoCropped(String, Vec<CropResult>),
     Neutral {
         key: String,
         result: Result<[f32; 2], String>,
@@ -43,9 +46,133 @@ pub enum Event {
     Progress(String),
     Loaded(String, Arc<Scan>),
     Failed(String, String),
-    Analysis(String, Result<Analysis, String>),
+    Analysis(String, Result<Conversion, String>),
+    FrameAnalysis(String, String, Result<Conversion, String>),
     Finished,
     Exported(PathBuf, Vec<ExportFailure>, Option<Box<ExportRetry>>),
+}
+
+pub struct OrientationBatch {
+    pub backend: String,
+    pub frames: Vec<OrientationResult>,
+}
+
+pub struct OrientationResult {
+    pub id: String,
+    pub previous_rotation: u8,
+    pub previous_crop: film::Rect,
+    pub previous_mirrored: bool,
+    pub guess: Result<film::UprightGuess, String>,
+}
+
+/// Analyze positive previews with one local model instance, off the UI thread.
+pub fn auto_orient(
+    roll: Roll,
+    cached: HashMap<String, Arc<Scan>>,
+    tx: Sender<Event>,
+    ctx: eframe::egui::Context,
+    profile: PathBuf,
+    runtime: Option<PathBuf>,
+) {
+    rayon::spawn(move || {
+        let result = (|| -> anyhow::Result<OrientationBatch> {
+            let start = Instant::now();
+            let mut fallback = None;
+            let mut detector = if let Some(library) = runtime {
+                match film::UprightDetector::with_cuda(&library) {
+                    Ok(detector) => detector,
+                    Err(error) => {fallback = Some(error.to_string()); film::UprightDetector::new()?}
+                }
+            } else { film::UprightDetector::new()? };
+            record(&profile, &serde_json::json!({"stage":"upright-model-load","backend":detector.backend(),"fallback":fallback,"elapsed_ms":start.elapsed().as_secs_f64()*1000.}));
+            let mut results = Vec::new();
+            for (index, frame) in roll.frames.iter().enumerate() {
+                let _ = tx.send(Event::Progress(format!("Checking upright orientation {} of {}", index+1, roll.frames.len())));
+                ctx.request_repaint();
+                let start = Instant::now();
+                let guess = (|| -> anyhow::Result<film::UprightGuess> {
+                    anyhow::ensure!(roll.material == film::Material::Positive || roll.analysis_for(frame).is_some(), "Analyze this frame first");
+                    let scan = cached.get(&frame.id).cloned().map_or_else(
+                        || film::load_scan(&frame.path, Some(960), roll.demo).map(Arc::new), Ok,
+                    )?;
+                    if !cached.contains_key(&frame.id) {
+                        let _ = tx.send(Event::Loaded(frame.id.clone(), scan.clone()));
+                    }
+                    let crop = if frame.crop == film::Rect::default() {film::detect_frame_crop(&scan).unwrap_or_default()} else {frame.crop};
+                    // Absolute source orientation avoids composing quarter turns
+                    // incorrectly when the displayed frame is already mirrored.
+                    // Neutral creative controls keep exposure/color edits from hiding faces.
+                    let rgb = film::render(&scan, roll.material, roll.analysis_for(frame), film::Adjustments::default(), crop, 0, false, &[], false)?;
+                    let image = image::RgbImage::from_raw(rgb.width, rgb.height, rgb.to_rgb8()).ok_or_else(||anyhow::anyhow!("Invalid upright preview"))?;
+                    match detector.detect(&image) {
+                        Ok(guess) => Ok(guess),
+                        Err(error) if detector.backend() == "CUDA" => {
+                            fallback = Some(error.to_string());
+                            detector = film::UprightDetector::new()?;
+                            detector.detect(&image)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })().map_err(|e|e.to_string());
+                record(&profile, &serde_json::json!({"stage":"upright-frame","frame":frame.id,"backend":detector.backend(),"fallback":fallback,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"result":guess}));
+                results.push(OrientationResult {id:frame.id.clone(), previous_rotation:frame.rotation, previous_crop:frame.crop, previous_mirrored:frame.mirrored, guess});
+            }
+            if let Ok(Some(path)) = detector.finish_profile() {record(&profile,&serde_json::json!({"stage":"upright-cuda-profile","path":path}));}
+            Ok(OrientationBatch { backend: if fallback.is_some() {"CPU fallback".into()} else {detector.backend().into()}, frames: results })
+        })().map_err(|e|e.to_string());
+        let _ = tx.send(Event::AutoOriented(roll.id, result));
+        let _ = tx.send(Event::Finished);
+        ctx.request_repaint();
+    });
+}
+
+pub struct CropResult {
+    pub id: String,
+    pub previous: film::Rect,
+    pub crop: Result<Option<film::Rect>, String>,
+}
+
+/// Detect all picture crops off the UI thread, reusing loaded previews.
+pub fn auto_crop(
+    roll: Roll,
+    cached: HashMap<String, Arc<Scan>>,
+    tx: Sender<Event>,
+    ctx: eframe::egui::Context,
+) {
+    rayon::spawn(move || {
+        let mut results = Vec::with_capacity(roll.frames.len());
+        for (index, frame) in roll.frames.iter().enumerate() {
+            let _ = tx.send(Event::Progress(format!(
+                "Autocropping frame {} of {}",
+                index + 1,
+                roll.frames.len()
+            )));
+            ctx.request_repaint();
+            let scan = cached.get(&frame.id).cloned().map_or_else(
+                || {
+                    film::load_scan(&frame.path, Some(960), roll.demo)
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string())
+                },
+                Ok,
+            );
+            let crop = scan.map(|scan| {
+                let crop = film::detect_frame_crop(&scan);
+                if !cached.contains_key(&frame.id) {
+                    let _ = tx.send(Event::Loaded(frame.id.clone(), scan));
+                }
+                crop
+            });
+            results.push(CropResult {
+                id: frame.id.clone(),
+                previous: frame.crop,
+                crop,
+            });
+        }
+        let _ = tx.send(Event::AutoCropped(roll.id, results));
+        let _ = tx.send(Event::Finished);
+        ctx.request_repaint();
+    });
 }
 
 #[derive(Debug)]
@@ -69,23 +196,36 @@ pub fn load(
     rayon::spawn(move || {
         let start = Instant::now();
         let mut scans = Vec::new();
-        for (i, frame) in roll.frames.iter().enumerate() {
+        let mut failed_kept = false;
+        // RAW decoders already use several Rayon workers per image. Bound the
+        // number of live full-size mosaics while filling the remaining cores.
+        let batch_size = rayon::current_num_threads().div_ceil(4).clamp(1, 4);
+        for (batch_index, frames) in roll.frames.chunks(batch_size).enumerate() {
+            let first = batch_index * batch_size + 1;
+            let last = first + frames.len() - 1;
             let _ = tx.send(Event::Progress(format!(
-                "Reading frame {} of {}",
-                i + 1,
+                "Reading frames {first}–{last} of {}",
                 roll.frames.len()
             )));
             ctx.request_repaint();
-            match film::load_scan(&frame.path, Some(960), roll.demo) {
-                Ok(scan) => {
-                    let scan = Arc::new(scan);
-                    if !frame.rejected {
-                        scans.push(scan.clone());
+            let results: Vec<_> = frames
+                .par_iter()
+                .map(|frame| film::load_scan(&frame.path, Some(960), roll.demo))
+                .collect();
+            // Keep presentation, failures and calibration inputs in roll order.
+            for (frame, result) in frames.iter().zip(results) {
+                match result {
+                    Ok(scan) => {
+                        let scan = Arc::new(scan);
+                        if !frame.rejected {
+                            scans.push((frame.id.clone(), scan.clone()));
+                        }
+                        let _ = tx.send(Event::Loaded(frame.id.clone(), scan));
                     }
-                    let _ = tx.send(Event::Loaded(frame.id.clone(), scan));
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::Failed(frame.id.clone(), e.to_string()));
+                    Err(e) => {
+                        failed_kept |= !frame.rejected;
+                        let _ = tx.send(Event::Failed(frame.id.clone(), e.to_string()));
+                    }
                 }
             }
             ctx.request_repaint();
@@ -93,15 +233,73 @@ pub fn load(
         let load_ms = start.elapsed().as_secs_f64() * 1000.0;
         if analyze {
             let now = Instant::now();
-            let refs: Vec<_> = scans.iter().map(AsRef::as_ref).collect();
-            let result =
-                film::analyze(&refs, roll.base, roll.analysis_area).map_err(|e| e.to_string());
+            let refs: Vec<_> = scans
+                .iter()
+                .map(|(id, scan)| (id.as_str(), scan.as_ref()))
+                .collect();
+            let result = if roll.optimize_individually && failed_kept {
+                Err("Some kept scans could not be loaded. Restore those files or reject them before optimizing individually.".into())
+            } else {
+                Conversion::analyze(
+                    &refs,
+                    roll.optimize_individually,
+                    roll.base,
+                    roll.analysis_area,
+                    roll.calibration,
+                    &roll.frame_bases(),
+                )
+                .map(|mut conversion| {
+                    // Capture the requested set, including unreadable scans in
+                    // shared mode, so load failures are not mistaken for edits
+                    // made after the preview was built.
+                    if let Some(inputs) = &mut conversion.inputs {
+                        inputs.frames = roll
+                            .frames
+                            .iter()
+                            .filter(|f| !f.rejected)
+                            .map(|f| f.id.clone())
+                            .collect();
+                    }
+                    conversion
+                })
+                .map_err(|e| e.to_string())
+            };
             let _ = tx.send(Event::Analysis(roll.id.clone(), result));
             record(
                 &profile,
                 &serde_json::json!({"stage":"roll-analysis","frames":scans.len(),"load_ms":load_ms,"analysis_ms":now.elapsed().as_secs_f64()*1000.0}),
             );
         }
+        let _ = tx.send(Event::Finished);
+        ctx.request_repaint();
+    });
+}
+
+/// Build a single-frame proposal, reusing its linear preview when available.
+pub fn analyze_frame(
+    roll: Roll,
+    id: String,
+    cached: Option<Arc<Scan>>,
+    tx: Sender<Event>,
+    ctx: eframe::egui::Context,
+) {
+    rayon::spawn(move || {
+        let result = (|| -> anyhow::Result<Conversion> {
+            let frame = roll
+                .frames
+                .iter()
+                .find(|f| f.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Frame no longer exists"))?;
+            let scan = if let Some(scan) = cached {
+                scan
+            } else {
+                Arc::new(film::load_scan(&frame.path, Some(960), roll.demo)?)
+            };
+            let _ = tx.send(Event::Loaded(id.clone(), scan.clone()));
+            Conversion::analyze_frame(&roll, &id, &scan)
+        })()
+        .map_err(|e| e.to_string());
+        let _ = tx.send(Event::FrameAnalysis(roll.id, id, result));
         let _ = tx.send(Event::Finished);
         ctx.request_repaint();
     });
@@ -207,7 +405,7 @@ pub fn export_with_mode(
                 let prepared = prepare_export_source(
                     &frame,
                     material,
-                    analysis.as_ref(),
+                    analysis.as_ref().and_then(|a| a.for_frame(&frame.id)),
                     demo,
                     &source_profile,
                 );
@@ -260,6 +458,7 @@ pub fn export_with_mode(
                 let pending = path.with_file_name(format!(".{}-pending.{ext}", frame.id));
                 let prepared = source_rx.recv()??;
                 let settings = greign_gl_preview::Settings {
+                    mirrored: frame.mirrored,
                     edits: roll.adjustments.combined(frame.adjustments),
                     material: roll.material,
                     crop: frame.crop,
@@ -459,6 +658,7 @@ fn render_export(
             settings.edits,
             settings.crop,
             settings.rotation,
+            settings.mirrored,
             heals,
             &|| false,
         )?,
@@ -481,7 +681,13 @@ fn prepare_export_source(
         "elapsed_ms":now.elapsed().as_secs_f64()*1000.}),
     );
     let now = Instant::now();
-    let prepared = Arc::new(film::prepare(&scan, material, analysis, false, &|| false)?);
+    let prepared = Arc::new(film::prepare_owned(
+        scan,
+        material,
+        analysis,
+        false,
+        &|| false,
+    )?);
     record(
         profile,
         &serde_json::json!({"stage":"export-prepare","frame":frame.id,
@@ -588,6 +794,50 @@ pub fn record(path: &Path, value: &serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_cuda_runtime_falls_back_to_cpu_for_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut roll = Roll::new("CPU fallback");
+        roll.material = film::Material::Positive;
+        let frame = crate::model::Frame::new("cached.png".into());
+        let scan = Arc::new(Scan {
+            image: greign_pipeline::LinearRgbImage {
+                width: 128,
+                height: 96,
+                pixels: vec![[0.2; 3]; 128 * 96],
+            },
+            camera_matrix: None,
+            white_balance: [1.; 3],
+            capture: "test".into(),
+        });
+        let cached = HashMap::from([(frame.id.clone(), scan)]);
+        roll.frames.push(frame);
+        let (tx, rx) = std::sync::mpsc::channel();
+        auto_orient(
+            roll,
+            cached,
+            tx,
+            eframe::egui::Context::default(),
+            directory.path().join("timings.jsonl"),
+            Some(directory.path().join("missing-runtime.so")),
+        );
+        let mut checked = false;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap() {
+                Event::AutoOriented(_, result) => {
+                    let batch = result.unwrap();
+                    assert_eq!(batch.backend, "CPU fallback");
+                    assert_eq!(batch.frames.len(), 1);
+                    assert!(batch.frames[0].guess.as_ref().unwrap().rotation.is_none());
+                    checked = true;
+                }
+                Event::Finished => break,
+                _ => {}
+            }
+        }
+        assert!(checked);
+    }
+
     use super::*;
     use crate::model::Frame;
     use std::sync::mpsc;
@@ -656,6 +906,7 @@ mod tests {
                                 settings.edits,
                                 settings.crop,
                                 settings.rotation,
+                                settings.mirrored,
                                 &[],
                                 &|| false,
                             )
@@ -703,6 +954,7 @@ mod tests {
                                 settings.edits,
                                 settings.crop,
                                 settings.rotation,
+                                settings.mirrored,
                                 &[],
                                 &|| false,
                             )
@@ -765,6 +1017,7 @@ mod tests {
             pixels: vec![[0.2, 0.3, 0.4]; 4],
         });
         let settings = greign_gl_preview::Settings {
+            mirrored: false,
             edits: film::Adjustments::default(),
             material: film::Material::Positive,
             crop: film::Rect::default(),
@@ -775,6 +1028,7 @@ mod tests {
             settings.edits,
             settings.crop,
             settings.rotation,
+            settings.mirrored,
             &[],
             &|| false,
         )
@@ -815,6 +1069,7 @@ mod tests {
             pixels: (0..1024).map(|i| [i as f32 / 1024.; 3]).collect(),
         });
         let settings = greign_gl_preview::Settings {
+            mirrored: false,
             edits: film::Adjustments::default(),
             material: film::Material::Positive,
             crop: film::Rect::default(),
@@ -825,9 +1080,15 @@ mod tests {
             source: [0.7, 0.7],
             radius: 0.05,
         }];
-        let expected = film::finish(&prepared, settings.edits, settings.crop, 0, &heals, &|| {
-            false
-        })
+        let expected = film::finish(
+            &prepared,
+            settings.edits,
+            settings.crop,
+            0,
+            false,
+            &heals,
+            &|| false,
+        )
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let (actual, backend) = render_export(
@@ -955,6 +1216,95 @@ mod tests {
         }
         assert_eq!(fs::read(saved).unwrap(), bytes);
         assert_eq!(fs::read_dir(out).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn individual_analysis_and_mirrored_exports_use_each_frames_calibration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut roll = Roll::new("Individual exports");
+        roll.optimize_individually = true;
+        roll.export.tiff = true;
+        for (index, gain) in [1.0_f32, 0.65].into_iter().enumerate() {
+            let path = dir.path().join(format!("scan-{index}.png"));
+            image::RgbImage::from_fn(80, 60, |x, y| {
+                image::Rgb(
+                    [220., 180., 150.].map(|v| ((v - x as f32 - y as f32 * 0.4) * gain) as u8),
+                )
+            })
+            .save(&path)
+            .unwrap();
+            let mut frame = Frame::new(path);
+            frame.mirrored = true;
+            frame.rotation = index as u8;
+            roll.frames.push(frame);
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = eframe::egui::Context::default();
+        load(
+            roll.clone(),
+            true,
+            tx.clone(),
+            ctx.clone(),
+            dir.path().join("analysis.jsonl"),
+        );
+        loop {
+            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::Analysis(_, result) => roll.analysis = Some(result.unwrap()),
+                Event::Finished => break,
+                _ => {}
+            }
+        }
+        assert!(roll.analysis.as_ref().unwrap().individual);
+        assert!(
+            roll.analysis_for(&roll.frames[0]).unwrap().base[0]
+                - roll.analysis_for(&roll.frames[1]).unwrap().base[0]
+                > 0.1
+        );
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        export(
+            roll.clone(),
+            out.clone(),
+            None,
+            tx,
+            ctx,
+            dir.path().join("export.jsonl"),
+        );
+        loop {
+            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::Exported(_, errors, _) => assert!(errors.is_empty(), "{errors:?}"),
+                Event::Finished => break,
+                _ => {}
+            }
+        }
+        let mut files: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 2);
+        for (frame, path) in roll.frames.iter().zip(files) {
+            let scan = film::load_scan(&frame.path, None, false).unwrap();
+            let expected = film::render(
+                &scan,
+                roll.material,
+                roll.analysis_for(frame),
+                frame.adjustments,
+                frame.crop,
+                frame.rotation,
+                true,
+                &[],
+                false,
+            )
+            .unwrap();
+            let actual = image::open(path).unwrap().to_rgb16();
+            assert_eq!(actual.dimensions(), (expected.width, expected.height));
+            for (actual, expected) in actual.pixels().zip(expected.pixels) {
+                for (a, b) in actual.0.into_iter().zip(expected) {
+                    assert!((f32::from(a) / 65535. - b).abs() < 0.00002);
+                }
+            }
+        }
     }
 
     #[test]

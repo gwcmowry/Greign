@@ -20,6 +20,7 @@ pub fn run(
     root: &Path,
     jpeg: bool,
     long_edge: u32,
+    synthetic_only: bool,
 ) -> Result<()> {
     let directory = root
         .join(if jpeg {
@@ -79,128 +80,156 @@ pub fn run(
         let mut prepared = film::prepare(&scan, material, Some(&analysis), false, &|| false)?;
         // Deliberately signed/HDR working-space data tests the finishing stage.
         prepared.image = scan.image;
-        for rotation in 0..4 {
-            let crop = Rect {
-                x: 0.127,
-                y: 0.137,
-                w: 0.753,
-                h: 0.751,
-            };
-            let cpu = film::finish(&prepared, edits, crop, rotation, &[], &|| false)?;
-            let gpu = renderer.export_source(
-                &prepared.image,
-                Settings {
-                    edits,
-                    material,
-                    crop,
-                    rotation,
-                },
-            )?;
-            ensure!(
-                (cpu.width, cpu.height) == (gpu.width, gpu.height),
-                "Float export geometry mismatch"
-            );
-            let mut maximum = 0_f32;
-            for (a, b) in cpu.pixels.iter().flatten().zip(gpu.pixels.iter().flatten()) {
-                maximum = maximum.max((a - b).abs());
+        for (rotation, angle) in
+            (0..4).flat_map(|rotation| [0., -2.3, 3.1].map(move |angle| (rotation, angle)))
+        {
+            for mirrored in [false, true] {
+                let crop = Rect {
+                    x: 0.127,
+                    y: 0.137,
+                    w: 0.753,
+                    h: 0.751,
+                    angle,
+                };
+                let cpu = film::finish(&prepared, edits, crop, rotation, mirrored, &[], &|| false)?;
+                let gpu = renderer.export_source(
+                    &prepared.image,
+                    Settings {
+                        mirrored,
+                        edits,
+                        material,
+                        crop,
+                        rotation,
+                    },
+                )?;
                 ensure!(
-                    (a - b).abs() <= 0.00001 + a.abs() * 0.00002,
-                    "Float parity failed: {material:?}/{rotation}: {a} vs {b}"
+                    (cpu.width, cpu.height) == (gpu.width, gpu.height),
+                    "Float export geometry mismatch"
                 );
-            }
-            writeln!(log, "float-parity,{material:?},{rotation},{maximum}")?;
-            if jpeg {
-                let actual = renderer.export_jpeg_source(
-                    &prepared.image,
-                    Settings {
-                        edits,
-                        material,
-                        crop,
-                        rotation,
-                    },
-                )?;
-                let reference = greign_pipeline::rec2020_to_srgb(cpu.clone());
-                let expected = reference.to_rgb8();
-                let maximum = actual
-                    .as_raw()
-                    .iter()
-                    .zip(&expected)
-                    .map(|(a, b)| a.abs_diff(*b))
-                    .max()
-                    .unwrap_or(0);
-                ensure!(maximum <= 1, "Pre-codec JPEG RGB8 parity failed: {maximum}");
-                writeln!(log, "jpeg-rgb8-parity,{material:?},{rotation},{maximum}")?;
-                // Resized exports retain float sRGB until final quantization.
-                let gpu_srgb = renderer.export_srgb_source(
-                    &prepared.image,
-                    Settings {
-                        edits,
-                        material,
-                        crop,
-                        rotation,
-                    },
-                )?;
-                let gpu_float = image::Rgb32FImage::from_raw(
-                    gpu_srgb.width,
-                    gpu_srgb.height,
-                    gpu_srgb.pixels.iter().flatten().copied().collect(),
-                )
-                .unwrap();
-                let gpu_resized = image::imageops::resize(
-                    &gpu_float,
-                    31,
-                    23,
-                    image::imageops::FilterType::Lanczos3,
-                );
-                let compact = greign_pipeline::SrgbImage {
-                    width: 31,
-                    height: 23,
-                    pixels: gpu_resized.pixels().map(|p| p.0).collect(),
-                }
-                .to_rgb8();
-                let floats = image::Rgb32FImage::from_raw(
-                    reference.width,
-                    reference.height,
-                    reference.pixels.iter().flatten().copied().collect(),
-                )
-                .unwrap();
-                let resized =
-                    image::imageops::resize(&floats, 31, 23, image::imageops::FilterType::Lanczos3);
-                let expected = greign_pipeline::SrgbImage {
-                    width: 31,
-                    height: 23,
-                    pixels: resized.pixels().map(|p| p.0).collect(),
-                }
-                .to_rgb8();
-                let maximum = compact
-                    .iter()
-                    .zip(&expected)
-                    .map(|(a, b)| a.abs_diff(*b))
-                    .max()
-                    .unwrap_or(0);
-                ensure!(maximum <= 1, "Resized JPEG RGB8 parity failed: {maximum}");
-                writeln!(log, "jpeg-resize-parity,{material:?},{rotation},{maximum}")?;
-            }
-            if material == Material::Positive && rotation == 1 {
-                // Exercise the linear DNG writer with signed/HDR float output,
-                // then independently read its strips rather than trusting the
-                // in-memory render comparison alone.
-                for (name, image) in [("cpu", &cpu), ("gpu", &gpu)] {
-                    let path = directory.join(format!("{name}-float-fixture.dng"));
-                    greign_export::export_linear_dng(image, &path)?;
-                    let decoded = dng_samples(&path)?;
+                let mut maximum = 0_f32;
+                // A tilted crop interpolates sharply discontinuous HDR texels.
+                // GPU fused multiply-adds can shift the f32 sample coordinate by
+                // a few ulps; keep the stricter original tolerance for exact crops.
+                let absolute_tolerance = if angle == 0. { 0.00001 } else { 0.00005 };
+                for (a, b) in cpu.pixels.iter().flatten().zip(gpu.pixels.iter().flatten()) {
+                    maximum = maximum.max((a - b).abs());
                     ensure!(
-                        decoded.iter().copied().eq(image
-                            .pixels
-                            .iter()
-                            .flatten()
-                            .map(|v| v.max(0.0))),
-                        "DNG did not preserve float samples"
+                        (a - b).abs() <= absolute_tolerance + a.abs() * 0.00002,
+                        "Float parity failed: {material:?}/{rotation}/{angle}: {a} vs {b}"
                     );
                 }
-                writeln!(log, "dng-float-roundtrip,exact")?;
+                writeln!(
+                    log,
+                    "float-parity,{material:?},{rotation},{mirrored},{angle},{maximum}"
+                )?;
+                if jpeg {
+                    let actual = renderer.export_jpeg_source(
+                        &prepared.image,
+                        Settings {
+                            mirrored,
+                            edits,
+                            material,
+                            crop,
+                            rotation,
+                        },
+                    )?;
+                    let reference = greign_pipeline::rec2020_to_srgb(cpu.clone());
+                    let expected = reference.to_rgb8();
+                    let maximum = actual
+                        .as_raw()
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap_or(0);
+                    ensure!(maximum <= 1, "Pre-codec JPEG RGB8 parity failed: {maximum}");
+                    writeln!(
+                        log,
+                        "jpeg-rgb8-parity,{material:?},{rotation},{mirrored},{angle},{maximum}"
+                    )?;
+                    // Resized exports retain float sRGB until final quantization.
+                    let gpu_srgb = renderer.export_srgb_source(
+                        &prepared.image,
+                        Settings {
+                            mirrored,
+                            edits,
+                            material,
+                            crop,
+                            rotation,
+                        },
+                    )?;
+                    let gpu_float = image::Rgb32FImage::from_raw(
+                        gpu_srgb.width,
+                        gpu_srgb.height,
+                        gpu_srgb.pixels.iter().flatten().copied().collect(),
+                    )
+                    .unwrap();
+                    let gpu_resized = image::imageops::resize(
+                        &gpu_float,
+                        31,
+                        23,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    let compact = greign_pipeline::SrgbImage {
+                        width: 31,
+                        height: 23,
+                        pixels: gpu_resized.pixels().map(|p| p.0).collect(),
+                    }
+                    .to_rgb8();
+                    let floats = image::Rgb32FImage::from_raw(
+                        reference.width,
+                        reference.height,
+                        reference.pixels.iter().flatten().copied().collect(),
+                    )
+                    .unwrap();
+                    let resized = image::imageops::resize(
+                        &floats,
+                        31,
+                        23,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    let expected = greign_pipeline::SrgbImage {
+                        width: 31,
+                        height: 23,
+                        pixels: resized.pixels().map(|p| p.0).collect(),
+                    }
+                    .to_rgb8();
+                    let maximum = compact
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap_or(0);
+                    ensure!(maximum <= 1, "Resized JPEG RGB8 parity failed: {maximum}");
+                    writeln!(
+                        log,
+                        "jpeg-resize-parity,{material:?},{rotation},{mirrored},{angle},{maximum}"
+                    )?;
+                }
+                if material == Material::Positive && rotation == 1 {
+                    // Exercise the linear DNG writer with signed/HDR float output,
+                    // then independently read its strips rather than trusting the
+                    // in-memory render comparison alone.
+                    for (name, image) in [("cpu", &cpu), ("gpu", &gpu)] {
+                        let path = directory.join(format!("{name}-float-fixture.dng"));
+                        greign_export::export_linear_dng(image, &path)?;
+                        let decoded = dng_samples(&path)?;
+                        ensure!(
+                            decoded.iter().copied().eq(image
+                                .pixels
+                                .iter()
+                                .flatten()
+                                .map(|v| v.max(0.0))),
+                            "DNG did not preserve float samples"
+                        );
+                    }
+                    writeln!(log, "dng-float-roundtrip,exact")?;
+                }
             }
         }
+    }
+    if synthetic_only {
+        return Ok(());
     }
     // Two real full-resolution camera files, not a preview texture or synthetic RAW.
     let mut roll = Roll::new("GPU export validation");

@@ -10,9 +10,17 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Step {
+    /// Supply a folder-picker result; the visible Import roll button still commits it.
+    ChooseRollFolder {
+        path: PathBuf,
+    },
     Click {
         x: f32,
         y: f32,
+        #[serde(default)]
+        command: bool,
+        #[serde(default)]
+        shift: bool,
     },
     Drag {
         x: f32,
@@ -64,14 +72,31 @@ impl Replay {
         let advance;
         let mut delay = 120;
         match &self.steps[self.index] {
-            Step::Click { x, y } => {
+            Step::ChooseRollFolder { path } => {
+                app.choose_import_folder(path.clone());
+                app.new_roll_open = true;
+                advance = true;
+            }
+            Step::Click {
+                x,
+                y,
+                command,
+                shift,
+            } => {
                 let pos = egui::pos2(*x, *y);
+                let modifiers = Modifiers {
+                    ctrl: *command,
+                    command: *command,
+                    shift: *shift,
+                    ..Default::default()
+                };
+                input.modifiers = modifiers;
                 input.events.push(Event::PointerMoved(pos));
                 input.events.push(Event::PointerButton {
                     pos,
                     button: PointerButton::Primary,
                     pressed: self.phase == 0,
-                    modifiers: Modifiers::default(),
+                    modifiers,
                 });
                 advance = self.phase == 1;
                 self.phase += 1;
@@ -100,6 +125,9 @@ impl Replay {
             } => {
                 let key = match name.as_str() {
                     "R" => egui::Key::R,
+                    "X" => egui::Key::X,
+                    "C" => egui::Key::C,
+                    "E" => egui::Key::E,
                     "Z" => egui::Key::Z,
                     "ArrowRight" => egui::Key::ArrowRight,
                     "ArrowLeft" => egui::Key::ArrowLeft,

@@ -39,11 +39,43 @@ Launch the standalone desktop application (no browser or local web server):
 Once built, `./target/release/greign-app` starts it directly. The window uses
 eframe/egui with OpenGL and requires a graphical desktop session.
 
-The prototype provides roll import and metadata, shared film analysis,
+For a short command on Linux, install a launcher from the repository root:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/target/release/greign-app" ~/.local/bin/greign
+```
+
+With `~/.local/bin` on your `PATH`, run `greign` from any directory. The link
+uses the current release build, so rebuilding updates what it launches.
+`./scripts/launch-greign.sh` remains the build-and-launch command. The headless
+inspection CLI is a separate binary at `./target/release/greign`.
+
+The prototype provides roll import and metadata, individual-frame film analysis by default,
 positive contact sheets, whole-roll and per-frame adjustments, manual dust
-healing, crop/rotation, undo/redo, and JPEG or 16-bit TIFF export. Originals
+healing, picture-frame autocrop/straightening, undo/redo, and JPEG or 16-bit TIFF export. Originals
 are referenced, not overwritten. Edits live in `.greign/rolls.json`; default
 exports go under `exports/film-rolls/` in this repository.
+
+Import an entire scan folder as a roll; its folder name becomes the roll name.
+Save a master export destination and a suffix such as ` - converted`, then use
+one-click **Export roll** or **Export ready rolls…** for the library. Outputs
+are grouped into named roll folders, with numbered folders for repeat exports.
+See the [folder workflow](docs/native-workflow.md#folder-import-and-a-collection-of-converted-rolls).
+
+**Autocrop all frames** and **Mirror all frames** are above the contact sheet.
+Both apply to the whole roll with one Undo step. Shared calibration remains
+available for consistent capture exposures.
+
+Select contact-sheet frames and press **R** to rotate them clockwise, or
+**Shift+R** to rotate counterclockwise. Each press is one Undo step. **X**
+toggles keep/reject.
+
+**Auto upright** uses a bundled local face model to suggest quarter-turn
+rotations for people photos. Clear matches are applied; uncertain frames keep
+their orientation and are marked for review. It supports local CPU inference
+and an optional Linux NVIDIA CUDA backend, with automatic CPU fallback and
+batch Undo. See the [setup and controls guide](docs/native-workflow.md).
 
 The workspace also includes multi-selection with relative edits, selective
 copy/paste, named versions and hold-to-compare, preview/accept re-analysis,

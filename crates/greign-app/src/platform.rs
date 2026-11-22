@@ -1,6 +1,61 @@
 //! Writable app locations and desktop integration, independent of the build host.
 use std::path::{Path, PathBuf};
 
+#[derive(serde::Deserialize)]
+struct UprightGpuConfig {
+    library: PathBuf,
+    library_dirs: Vec<PathBuf>,
+}
+
+fn upright_gpu_config(root: &Path) -> Option<UprightGpuConfig> {
+    if !cfg!(target_os = "linux") || std::env::var_os("GREIGN_CPU_UPRIGHT").is_some() {
+        return None;
+    }
+    let bytes = std::fs::read(root.join(".greign/upright-gpu.json")).ok()?;
+    let mut config: UprightGpuConfig = serde_json::from_slice(&bytes).ok()?;
+    config.library = root.join(config.library);
+    config.library_dirs = config
+        .library_dirs
+        .into_iter()
+        .map(|p| root.join(p))
+        .collect();
+    config.library.is_file().then_some(config)
+}
+
+pub fn upright_gpu_library(root: &Path) -> Option<PathBuf> {
+    upright_gpu_config(root).map(|config| config.library)
+}
+
+/// ELF resolves dependent CUDA libraries at process startup. Re-exec once,
+/// before UI/worker threads, with only the installed local library paths added.
+pub fn prepare_upright_gpu_loader(root: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let Some(config) = upright_gpu_config(root) else {
+            return;
+        };
+        if std::env::var_os("GREIGN_UPRIGHT_GPU_LOADER_READY").is_some() {
+            return;
+        }
+        let mut paths = config.library_dirs;
+        if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let (Ok(paths), Ok(executable)) = (std::env::join_paths(paths), std::env::current_exe())
+        {
+            let error = std::process::Command::new(executable)
+                .args(std::env::args_os().skip(1))
+                .env("LD_LIBRARY_PATH", paths)
+                .env("GREIGN_UPRIGHT_GPU_LOADER_READY", "1")
+                .exec();
+            eprintln!("GPU loader setup failed; CPU fallback remains available: {error}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
+}
+
 pub fn workspace_root() -> anyhow::Result<PathBuf> {
     let root = if let Some(path) = std::env::var_os("GREIGN_WORKSPACE") {
         PathBuf::from(path)
