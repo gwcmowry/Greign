@@ -1,5 +1,6 @@
 use crate::model::Roll;
 use greign_film::{self as film, Analysis, Scan};
+use rayon::prelude::*;
 use std::{
     collections::HashSet,
     fs,
@@ -69,23 +70,34 @@ pub fn load(
     rayon::spawn(move || {
         let start = Instant::now();
         let mut scans = Vec::new();
-        for (i, frame) in roll.frames.iter().enumerate() {
+        // RAW decoders already use several Rayon workers per image. Bound the
+        // number of live full-size mosaics while filling the remaining cores.
+        let batch_size = rayon::current_num_threads().div_ceil(4).clamp(1, 4);
+        for (batch_index, frames) in roll.frames.chunks(batch_size).enumerate() {
+            let first = batch_index * batch_size + 1;
+            let last = first + frames.len() - 1;
             let _ = tx.send(Event::Progress(format!(
-                "Reading frame {} of {}",
-                i + 1,
+                "Reading frames {first}–{last} of {}",
                 roll.frames.len()
             )));
             ctx.request_repaint();
-            match film::load_scan(&frame.path, Some(960), roll.demo) {
-                Ok(scan) => {
-                    let scan = Arc::new(scan);
-                    if !frame.rejected {
-                        scans.push(scan.clone());
+            let results: Vec<_> = frames
+                .par_iter()
+                .map(|frame| film::load_scan(&frame.path, Some(960), roll.demo))
+                .collect();
+            // Keep presentation, failures and calibration inputs in roll order.
+            for (frame, result) in frames.iter().zip(results) {
+                match result {
+                    Ok(scan) => {
+                        let scan = Arc::new(scan);
+                        if !frame.rejected {
+                            scans.push(scan.clone());
+                        }
+                        let _ = tx.send(Event::Loaded(frame.id.clone(), scan));
                     }
-                    let _ = tx.send(Event::Loaded(frame.id.clone(), scan));
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::Failed(frame.id.clone(), e.to_string()));
+                    Err(e) => {
+                        let _ = tx.send(Event::Failed(frame.id.clone(), e.to_string()));
+                    }
                 }
             }
             ctx.request_repaint();
@@ -481,7 +493,13 @@ fn prepare_export_source(
         "elapsed_ms":now.elapsed().as_secs_f64()*1000.}),
     );
     let now = Instant::now();
-    let prepared = Arc::new(film::prepare(&scan, material, analysis, false, &|| false)?);
+    let prepared = Arc::new(film::prepare_owned(
+        scan,
+        material,
+        analysis,
+        false,
+        &|| false,
+    )?);
     record(
         profile,
         &serde_json::json!({"stage":"export-prepare","frame":frame.id,

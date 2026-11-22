@@ -1,6 +1,7 @@
 //! Sensor-domain normalization, repair, crop, and white balance.
 
-use greign_raw::Mosaic;
+use greign_raw::{ActiveArea, Mosaic};
+use rayon::prelude::*;
 
 use crate::{CfaColor, CfaPattern, NormalizedMosaic, PipelineError, SensorPoint};
 
@@ -11,6 +12,11 @@ use crate::{CfaColor, CfaPattern, NormalizedMosaic, PipelineError, SensorPoint};
 /// Returns [`PipelineError`] for unsupported components, invalid CFA/levels,
 /// or inconsistent dimensions.
 pub fn normalize_sensor(mosaic: &Mosaic) -> Result<NormalizedMosaic, PipelineError> {
+    let cfa = sensor_pattern(mosaic)?;
+    normalize_all(mosaic, cfa)
+}
+
+fn sensor_pattern(mosaic: &Mosaic) -> Result<CfaPattern, PipelineError> {
     if mosaic.metadata.components_per_pixel != 1 {
         return Err(PipelineError::UnsupportedComponents);
     }
@@ -34,7 +40,11 @@ pub fn normalize_sensor(mosaic: &Mosaic) -> Result<NormalizedMosaic, PipelineErr
     validate_levels(&mosaic.metadata.black_levels, &cfa)?;
     validate_levels(&mosaic.metadata.white_levels, &cfa)?;
 
-    let mut samples = Vec::with_capacity(expected);
+    Ok(cfa)
+}
+
+fn normalize_all(mosaic: &Mosaic, cfa: CfaPattern) -> Result<NormalizedMosaic, PipelineError> {
+    let mut samples = Vec::with_capacity(mosaic.samples.len());
     for y in 0..mosaic.metadata.height {
         for x in 0..mosaic.metadata.width {
             let index = usize::try_from(y * mosaic.metadata.width + x)
@@ -50,6 +60,89 @@ pub fn normalize_sensor(mosaic: &Mosaic) -> Result<NormalizedMosaic, PipelineErr
     Ok(NormalizedMosaic {
         width: mosaic.metadata.width,
         height: mosaic.metadata.height,
+        cfa,
+        samples,
+    })
+}
+
+/// Normalizes a film scan directly into its cropped full-size or reduced sensor plane.
+/// Preview averages retain the original sample order and per-site black and white levels.
+///
+/// # Errors
+///
+/// Returns the same sensor, crop and reduction errors as the individual operations.
+pub fn normalize_scan(
+    mosaic: &Mosaic,
+    area: Option<ActiveArea>,
+    max_dimension: Option<u32>,
+) -> Result<NormalizedMosaic, PipelineError> {
+    let cfa = sensor_pattern(mosaic)?;
+    let (sensor_width, sensor_height) = (mosaic.metadata.width, mosaic.metadata.height);
+    // Preserve the general normalization path for non-Bayer and degenerate sensors.
+    if cfa.width() != 2 || sensor_width < 2 || sensor_height < 2 {
+        let mut normalized = normalize_all(mosaic, cfa)?;
+        if let Some(a) = area {
+            normalized = active_crop(&normalized, a.x, a.y, a.width, a.height)?;
+        }
+        return match max_dimension {
+            Some(size) => downsample_bayer(&normalized, size),
+            None => Ok(normalized),
+        };
+    }
+    let mut levels = [[(0.0, 0.0); 2]; 2];
+    for (y, row) in (0..2).zip(&mut levels) {
+        for (x, level) in (0..2).zip(row) {
+            let black = level_at(&mosaic.metadata.black_levels, &cfa, x, y);
+            let white = level_at(&mosaic.metadata.white_levels, &cfa, x, y);
+            if !black.is_finite() || !white.is_finite() || white <= black {
+                return Err(PipelineError::InvalidLevels);
+            }
+            *level = (black, white - black);
+        }
+    }
+    let a = area.unwrap_or(ActiveArea {
+        x: 0,
+        y: 0,
+        width: sensor_width,
+        height: sensor_height,
+    });
+    if a.width == 0
+        || a.height == 0
+        || a.x
+            .checked_add(a.width)
+            .is_none_or(|end| end > sensor_width)
+        || a.y
+            .checked_add(a.height)
+            .is_none_or(|end| end > sensor_height)
+    {
+        return Err(PipelineError::InvalidCrop);
+    }
+    let cfa = cfa.shifted(a.x, a.y);
+    let sample = |x: u32, y: u32| {
+        let (x, y) = (a.x + x, a.y + y);
+        let (black, range) = levels[(y & 1) as usize][(x & 1) as usize];
+        (f32::from(mosaic.samples[y as usize * sensor_width as usize + x as usize]) - black) / range
+    };
+    if let Some(size) = max_dimension {
+        if size == 0 {
+            return Err(PipelineError::InvalidDimensions);
+        }
+        if a.width.max(a.height) > size {
+            return reduce_bayer(a.width, a.height, cfa, size, sample);
+        }
+    }
+    let mut samples = vec![0.; a.width as usize * a.height as usize];
+    samples
+        .par_chunks_mut(a.width as usize)
+        .zip(0..a.height)
+        .for_each(|(row, y)| {
+            for (v, x) in row.iter_mut().zip(0..a.width) {
+                *v = sample(x, y);
+            }
+        });
+    Ok(NormalizedMosaic {
+        width: a.width,
+        height: a.height,
         cfa,
         samples,
     })
@@ -203,54 +296,69 @@ pub fn downsample_bayer(
     if expected != mosaic.samples.len() {
         return Err(PipelineError::InvalidDimensions);
     }
-    let largest = mosaic.width.max(mosaic.height);
-    let mut factor = largest.div_ceil(max_dimension);
-    if factor <= 1 {
+    if mosaic.width.max(mosaic.height) <= max_dimension {
         return Ok(mosaic.clone());
     }
+    reduce_bayer(
+        mosaic.width,
+        mosaic.height,
+        mosaic.cfa.clone(),
+        max_dimension,
+        |x, y| mosaic.samples[mosaic.index(x, y)],
+    )
+}
+
+fn reduce_bayer(
+    source_width: u32,
+    source_height: u32,
+    cfa: CfaPattern,
+    max_dimension: u32,
+    sample: impl Fn(u32, u32) -> f32 + Sync,
+) -> Result<NormalizedMosaic, PipelineError> {
+    let mut factor = source_width.max(source_height).div_ceil(max_dimension);
     if factor % 2 != 0 {
         factor = factor.saturating_add(1);
     }
-    let width = mosaic.width.div_ceil(factor);
-    let height = mosaic.height.div_ceil(factor);
-    let capacity = usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .ok_or(PipelineError::InvalidDimensions)?;
-    let mut samples = Vec::with_capacity(capacity);
-    for output_y in 0..height {
-        for output_x in 0..width {
-            let target = mosaic.cfa.color_at(output_x, output_y);
-            // Shift a partial final block inward just enough to retain both
-            // CFA row and column phases at the physical edge.
-            let source_x = (output_x * factor).min(mosaic.width.saturating_sub(2));
-            let source_y = (output_y * factor).min(mosaic.height.saturating_sub(2));
-            let right = source_x.saturating_add(factor).min(mosaic.width);
-            let bottom = source_y.saturating_add(factor).min(mosaic.height);
-            let mut sum = 0.0_f32;
-            let mut count = 0.0_f32;
-            for y in source_y..bottom {
-                for x in source_x..right {
-                    if mosaic.cfa.color_at(x, y) == target {
-                        sum += mosaic.samples[mosaic.index(x, y)];
-                        count += 1.0;
+    let width = source_width.div_ceil(factor);
+    let height = source_height.div_ceil(factor);
+    let phases = [
+        [cfa.color_at(0, 0), cfa.color_at(1, 0)],
+        [cfa.color_at(0, 1), cfa.color_at(1, 1)],
+    ];
+    let mut samples = vec![0.; width as usize * height as usize];
+    samples
+        .par_chunks_mut((width as usize).max(1))
+        .zip(0..height)
+        .try_for_each(|(row, output_y)| {
+            for (value, output_x) in row.iter_mut().zip(0..width) {
+                let target = phases[(output_y & 1) as usize][(output_x & 1) as usize];
+                // Shift partial blocks inward to retain both CFA phases at the edge.
+                let source_x = (output_x * factor).min(source_width.saturating_sub(2));
+                let source_y = (output_y * factor).min(source_height.saturating_sub(2));
+                let right = source_x.saturating_add(factor).min(source_width);
+                let bottom = source_y.saturating_add(factor).min(source_height);
+                let mut sum = 0.0_f32;
+                let mut count = 0.0_f32;
+                for y in source_y..bottom {
+                    let colors = phases[(y & 1) as usize];
+                    for x in source_x..right {
+                        if colors[(x & 1) as usize] == target {
+                            sum += sample(x, y);
+                            count += 1.0;
+                        }
                     }
                 }
+                if count < 0.5 {
+                    return Err(PipelineError::InvalidDimensions);
+                }
+                *value = sum / count;
             }
-            if count < 0.5 {
-                return Err(PipelineError::InvalidDimensions);
-            }
-            samples.push(sum / count);
-        }
-    }
+            Ok(())
+        })?;
     Ok(NormalizedMosaic {
         width,
         height,
-        cfa: mosaic.cfa.clone(),
+        cfa,
         samples,
     })
 }
@@ -440,6 +548,41 @@ mod tests {
             white_balance: [2.0, 1.0, 3.0],
             cfa_pattern: Some("RGGB".into()),
             xyz_to_camera_d65: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    #[test]
+    fn fused_scan_matches_separate_steps_with_shifted_levels_and_partial_blocks() {
+        let mut mosaic = Mosaic {
+            metadata: metadata(33, 29),
+            samples: (0_u16..33 * 29)
+                .map(|i| i.wrapping_mul(97) % 4096)
+                .collect(),
+        };
+        mosaic.metadata.black_levels = vec![64., 53., 71., 68.];
+        mosaic.metadata.white_levels = vec![1064., 1032., 999., 1101.];
+        for pattern in ["RGGB", "BGGR", "GRBG", "GBRG"] {
+            mosaic.metadata.cfa_pattern = Some(pattern.into());
+            let area = greign_raw::ActiveArea {
+                x: 1,
+                y: 3,
+                width: 31,
+                height: 25,
+            };
+            let original = normalize_sensor(&mosaic).unwrap();
+            let cropped = active_crop(&original, area.x, area.y, area.width, area.height).unwrap();
+            for size in [None, Some(64), Some(7), Some(4), Some(1)] {
+                let expected = size.map_or_else(
+                    || cropped.clone(),
+                    |size| downsample_bayer(&cropped, size).unwrap(),
+                );
+                let actual = super::normalize_scan(&mosaic, Some(area), size).unwrap();
+                assert_eq!(
+                    (actual.width, actual.height, actual.cfa),
+                    (expected.width, expected.height, expected.cfa)
+                );
+                assert_eq!(actual.samples, expected.samples);
+            }
         }
     }
 

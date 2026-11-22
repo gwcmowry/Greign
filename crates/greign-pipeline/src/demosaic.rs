@@ -2,6 +2,8 @@
 
 use crate::{CfaColor, LinearRgbImage, NormalizedMosaic, PipelineError, active_crop};
 
+use rayon::prelude::*;
+
 const PPG_RADIUS: u32 = 3;
 const PPG_TILE_HALO: u32 = PPG_RADIUS + 1;
 
@@ -39,31 +41,71 @@ pub fn bilinear_demosaic(mosaic: &NormalizedMosaic) -> Result<LinearRgbImage, Pi
 ///
 /// Returns [`PipelineError::UnsupportedCfa`] for non-Bayer patterns.
 pub fn ppg_demosaic(mosaic: &NormalizedMosaic) -> Result<LinearRgbImage, PipelineError> {
+    use CfaColor::{Blue, Green, Red};
     require_bayer(mosaic, "PPG")?;
-    // PPG needs three raw pixels for directional green and one additional
-    // green pixel for the red/blue pass. Physical borders use bilinear values.
-    let mut pixels = vec![[0.0_f32; 3]; mosaic.samples.len()];
-    for y in 0..mosaic.height {
-        for x in 0..mosaic.width {
-            let index = mosaic.index(x, y);
-            if is_ppg_border(mosaic, x, y) {
-                pixels[index] = bilinear_pixel(mosaic, x, y).map(|channel| channel.max(0.0));
-                continue;
-            }
-            let color = mosaic.cfa.color_at(x, y);
-            let channel = color_channel(color);
-            pixels[index][channel] = mosaic.samples[index].max(0.0);
-            if color != CfaColor::Green {
-                pixels[index][1] = ppg_green(mosaic, x, y).max(0.0);
-            }
-        }
+    let width = mosaic.width as usize;
+    let height = mosaic.height as usize;
+    if width.checked_mul(height) != Some(mosaic.samples.len()) {
+        return Err(PipelineError::InvalidDimensions);
     }
-    for y in 1..mosaic.height.saturating_sub(1) {
-        for x in 1..mosaic.width.saturating_sub(1) {
-            let index = mosaic.index(x, y);
-            let color = ppg_red_blue(mosaic, &pixels, x, y);
-            pixels[index] = color.map(|channel| channel.max(0.0));
-        }
+    let phases = [
+        [mosaic.cfa.color_at(0, 0), mosaic.cfa.color_at(1, 0)],
+        [mosaic.cfa.color_at(0, 1), mosaic.cfa.color_at(1, 1)],
+    ];
+    let mut pixels = vec![[0.0; 3]; mosaic.samples.len()];
+    // A standard Bayer pattern only reads measured red/blue and first-pass green
+    // from adjacent rows. Other accepted 2x2 layouts retain serial update order.
+    let standard = matches!(
+        phases,
+        [[Red, Green], [Green, Blue]]
+            | [[Blue, Green], [Green, Red]]
+            | [[Green, Red], [Blue, Green]]
+            | [[Green, Blue], [Red, Green]]
+    );
+    if !pixels.is_empty() {
+        let band_height = if standard { height.min(32) } else { height };
+        pixels
+            .par_chunks_mut(width * band_height)
+            .enumerate()
+            .for_each_init(Vec::new, |scratch, (band, output)| {
+                let start = band * band_height;
+                let end = start + output.len() / width;
+                // One extra first-pass row on either side supplies second-pass neighbors.
+                let top = start.saturating_sub(1);
+                let bottom = (end + 1).min(height);
+                scratch.resize((bottom - top) * width, [0.; 3]);
+                for (row, sy) in scratch
+                    .chunks_exact_mut(width)
+                    .zip((0..mosaic.height).skip(top))
+                {
+                    let y = sy as usize;
+                    let colors = phases[y & 1];
+                    for (pixel, sx) in row.iter_mut().zip(0..mosaic.width) {
+                        let x = sx as usize;
+                        if is_ppg_border(mosaic, sx, sy) {
+                            *pixel = bilinear_pixel(mosaic, sx, sy).map(|v| v.max(0.));
+                        } else {
+                            let color = colors[x & 1];
+                            *pixel = [0.; 3];
+                            pixel[color_channel(color)] = mosaic.samples[y * width + x].max(0.);
+                            if color != CfaColor::Green {
+                                pixel[1] = ppg_green(mosaic, sx, sy).max(0.);
+                            }
+                        }
+                    }
+                }
+                for y in start.max(1)..end.min(height.saturating_sub(1)) {
+                    let colors = phases[y & 1];
+                    for x in 1..width.saturating_sub(1) {
+                        let i = (y - top) * width + x;
+                        scratch[i] =
+                            ppg_red_blue(scratch, i, width, colors[x & 1], colors[(x + 1) & 1])
+                                .map(|v| v.max(0.));
+                    }
+                }
+                let offset = (start - top) * width;
+                output.copy_from_slice(&scratch[offset..offset + output.len()]);
+            });
     }
     Ok(LinearRgbImage {
         width: mosaic.width,
@@ -246,19 +288,20 @@ fn sample_offset(mosaic: &NormalizedMosaic, x: u32, y: u32, dx: i32, dy: i32) ->
     mosaic.samples[mosaic.index(x, y)]
 }
 
-fn ppg_red_blue(mosaic: &NormalizedMosaic, pixels: &[[f32; 3]], x: u32, y: u32) -> [f32; 3] {
-    let index = |dx: i32, dy: i32| {
-        let nx = x.checked_add_signed(dx).expect("PPG x is inside halo");
-        let ny = y.checked_add_signed(dy).expect("PPG y is inside halo");
-        mosaic.index(nx, ny)
-    };
-    let mut color = pixels[index(0, 0)];
-    if mosaic.cfa.color_at(x, y) == CfaColor::Green {
-        let top = pixels[index(0, -1)];
-        let bottom = pixels[index(0, 1)];
-        let left = pixels[index(-1, 0)];
-        let right = pixels[index(1, 0)];
-        if mosaic.cfa.color_at(x + 1, y) == CfaColor::Red {
+fn ppg_red_blue(
+    pixels: &[[f32; 3]],
+    i: usize,
+    width: usize,
+    center: CfaColor,
+    right_color: CfaColor,
+) -> [f32; 3] {
+    let mut color = pixels[i];
+    if center == CfaColor::Green {
+        let top = pixels[i - width];
+        let bottom = pixels[i + width];
+        let left = pixels[i - 1];
+        let right = pixels[i + 1];
+        if right_color == CfaColor::Red {
             color[2] = (top[2] + bottom[2] + 2.0 * color[1] - top[1] - bottom[1]) * 0.5;
             color[0] = (left[0] + right[0] + 2.0 * color[1] - left[1] - right[1]) * 0.5;
         } else {
@@ -266,15 +309,11 @@ fn ppg_red_blue(mosaic: &NormalizedMosaic, pixels: &[[f32; 3]], x: u32, y: u32) 
             color[2] = (left[2] + right[2] + 2.0 * color[1] - left[1] - right[1]) * 0.5;
         }
     } else {
-        let target = if mosaic.cfa.color_at(x, y) == CfaColor::Red {
-            2
-        } else {
-            0
-        };
-        let top_left = pixels[index(-1, -1)];
-        let top_right = pixels[index(1, -1)];
-        let bottom_left = pixels[index(-1, 1)];
-        let bottom_right = pixels[index(1, 1)];
+        let target = if center == CfaColor::Red { 2 } else { 0 };
+        let top_left = pixels[i - width - 1];
+        let top_right = pixels[i - width + 1];
+        let bottom_left = pixels[i + width - 1];
+        let bottom_right = pixels[i + width + 1];
         let difference_one = (top_left[target] - bottom_right[target]).abs()
             + (top_left[1] - color[1]).abs()
             + (bottom_right[1] - color[1]).abs();
@@ -404,7 +443,7 @@ mod tests {
 
     #[test]
     fn tiled_edge_aware_is_identical_at_seams_for_all_bayer_layouts() {
-        let (width, height) = (29, 23);
+        let (width, height) = (29, 67);
         for pattern in ["RGGB", "BGGR", "GRBG", "GBRG"] {
             let cfa = CfaPattern::parse(pattern).expect("CFA");
             let samples = (0..height)

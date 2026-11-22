@@ -215,13 +215,11 @@ pub fn load_scan(path: &Path, max_dimension: Option<u32>, demo: bool) -> Result<
         });
     }
     let raw = RawlerDecoder.mosaic(path)?;
-    let mut sensor = p::normalize_sensor(&raw)?;
-    if let Some(a) = raw.metadata.crop_area.or(raw.metadata.active_area) {
-        sensor = p::active_crop(&sensor, a.x, a.y, a.width, a.height)?;
-    }
-    if let Some(size) = max_dimension {
-        sensor = p::downsample_bayer(&sensor, size)?;
-    }
+    let sensor = p::normalize_scan(
+        &raw,
+        raw.metadata.crop_area.or(raw.metadata.active_area),
+        max_dimension,
+    )?;
     // No highlight invention, as-shot WB, display shoulder, or pre-inversion clipping.
     let rgb = p::ppg_demosaic(&sensor)?;
     let oriented = SrgbImage {
@@ -476,7 +474,21 @@ pub fn prepare(
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Prepared> {
     ensure!(!cancelled(), "Preview superseded");
-    let mut rgb = scan.image.clone();
+    prepare_owned(scan.clone(), material, analysis, show_negative, cancelled)
+}
+
+/// Prepares an exclusively owned scan, reusing its full-resolution pixel storage.
+/// # Errors
+/// Invalid analysis/matrix, or a superseded preview request.
+pub fn prepare_owned(
+    scan: Scan,
+    material: Material,
+    analysis: Option<&Analysis>,
+    show_negative: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Prepared> {
+    ensure!(!cancelled(), "Preview superseded");
+    let mut rgb = scan.image;
     if show_negative {
         let high = rgb
             .pixels
