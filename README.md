@@ -4,10 +4,15 @@ Greign is a Linux-first, GPU-accelerated, non-destructive RAW developer and
 photographic library. Its defining workflow is fast, roll-aware conversion of
 camera-scanned film negatives.
 
-**Apple Silicon Mac (M1 or newer), macOS 12 or later:** [Download the Mac beta (.dmg)](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-macos.2/Greign-macos-arm64.dmg).
-Open the disk image, drag Greign to Applications, then open Greign and import a folder of scans.
-Both Auto Upright models are included and run locally. Sign in to a GitHub account with repository access to download the private beta.
-See [first-launch help and installation details](docs/macos.md).
+## Get Greign
+
+Sign in to GitHub with an account that has access to the [private beta release](https://github.com/gwcmowry/Greign/releases). Both Auto Upright models are bundled for offline use.
+
+| Platform | Install |
+| --- | --- |
+| Ubuntu desktop, x86-64 | [Download the Debian package](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-beta.1/Greign-linux-amd64.deb). [Install guide](docs/linux.md). |
+| Apple Silicon Mac, macOS 12 or later | [Download the DMG](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-beta.1/Greign-macos-arm64.dmg), then drag Greign to Applications. [First-launch help](docs/macos.md). |
+| Windows x64 | [Build from source with MSVC](docs/windows.md). |
 
 The project is under active, gate-driven development. See [PLAN.md](PLAN.md)
 for the product scope, architecture, performance contract, and ordered exit

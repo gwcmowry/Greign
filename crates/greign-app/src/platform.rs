@@ -75,13 +75,35 @@ fn default_workspace() -> anyhow::Result<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn default_workspace() -> anyhow::Result<PathBuf> {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if source.join("Cargo.toml").is_file() {
+    if source.join("Cargo.toml").is_file()
+        && std::env::current_exe()?
+            .canonicalize()?
+            .starts_with(source.canonicalize()?.join("target"))
+    {
         return Ok(source);
     }
+    user_workspace()
+}
+
+#[cfg(target_os = "windows")]
+fn user_workspace() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not set"))?,
+    )
+    .join("Greign"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn user_workspace() -> anyhow::Result<PathBuf> {
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return Ok(data.join("greign"));
+    }
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map_or_else(|| PathBuf::from(home).join(".local/share"), PathBuf::from);
-    Ok(data.join("greign"))
+    Ok(PathBuf::from(home).join(".local/share/greign"))
 }
 
 pub fn export_directory(root: &Path) -> PathBuf {
@@ -97,6 +119,8 @@ pub fn export_directory(root: &Path) -> PathBuf {
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     let opener = if cfg!(target_os = "macos") {
         "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer.exe"
     } else {
         "xdg-open"
     };

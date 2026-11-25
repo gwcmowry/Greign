@@ -2,11 +2,11 @@
 
 On an Apple Silicon Mac (M1 or newer) running macOS 12 or later:
 
-1. Sign in to a GitHub account with access to Greign and [download Greign-macos-arm64.dmg](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-macos.2/Greign-macos-arm64.dmg).
+1. Sign in to a GitHub account with access to Greign and [download Greign-macos-arm64.dmg](https://github.com/gwcmowry/Greign/releases/download/v0.1.0-beta.1/Greign-macos-arm64.dmg).
 2. Open the disk image and drag Greign into Applications.
 3. Open Greign from Applications. If Gatekeeper blocks the first launch, open System Settings → Privacy & Security (System Preferences → Security & Privacy on Monterey), choose **Open Anyway** for Greign and confirm. The beta is ad-hoc signed and has not been notarized.
 
-Both orientation models are bundled and run on the CPU. The DMG includes everything needed to run the editor. A ZIP of the same app is available on the [release page](https://github.com/gwcmowry/Greign/releases/tag/v0.1.0-macos.2).
+Both orientation models are bundled and run on the CPU. The DMG includes everything needed to run the editor. A ZIP of the same app is available on the [release page](https://github.com/gwcmowry/Greign/releases/tag/v0.1.0-beta.1).
 
 Import your scans with the roll import control. The downloaded app opens with
 an empty library; private demo photographs are not distributed.

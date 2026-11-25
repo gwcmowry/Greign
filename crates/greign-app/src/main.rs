@@ -1946,6 +1946,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Greign — Film workspace")
+            .with_app_id("greign")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
+                "../assets/greign.png"
+            ))?)
             .with_inner_size([1440.0, 960.0])
             .with_min_inner_size([1080.0, 720.0]),
         ..Default::default()

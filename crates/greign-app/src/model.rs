@@ -647,7 +647,10 @@ pub fn save(path: &Path, library: &Library) -> Result<()> {
     }
     let pending = path.with_extension("pending.json");
     fs::write(&pending, data)?;
-    fs::File::open(&pending)?.sync_all()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&pending)?
+        .sync_all()?;
     fs::rename(pending, path)?;
     Ok(())
 }

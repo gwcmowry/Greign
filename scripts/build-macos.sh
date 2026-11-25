@@ -16,6 +16,7 @@ stage=$(mktemp -d "$PWD/dist/macos-$arch.XXXXXX")
 app="$stage/Greign.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$target/release/greign-app" "$app/Contents/MacOS/greign-app"
+cp crates/greign-app/assets/Greign.icns "$app/Contents/Resources/"
 cp LICENSE docs/third-party.md "$app/Contents/Resources/"
 python3 scripts/license-notices.py "$target" "$app/Contents/Resources/ThirdPartyNotices.txt"
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -26,6 +27,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <key>CFBundleName</key><string>Greign</string>
 <key>CFBundleDisplayName</key><string>Greign</string>
 <key>CFBundleIdentifier</key><string>com.gwcmowry.greign</string>
+<key>CFBundleIconFile</key><string>Greign.icns</string>
 <key>CFBundleExecutable</key><string>greign-app</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>

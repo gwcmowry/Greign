@@ -1,4 +1,4 @@
-name: macOS app
+name: Desktop packages
 
 on:
   push:
@@ -55,16 +55,76 @@ jobs:
           path: artifacts/macos-smoke/
           if-no-files-found: ignore
 
+  linux-package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Debian package
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version=${GITHUB_REF_NAME#v}
+            version=${version/-/\~}
+          else
+            version="0.1.0~dev.$GITHUB_RUN_NUMBER"
+          fi
+          ./scripts/build-linux.sh "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Greign-linux-amd64
+          path: dist/Greign-linux-amd64.deb
+          if-no-files-found: error
+
+  linux-install:
+    needs: linux-package
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Greign-linux-amd64
+      - name: Install package and launch from outside the checkout
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ./Greign-linux-amd64.deb xvfb xauth desktop-file-utils python3-pil
+          desktop-file-validate /usr/share/applications/greign.desktop
+          cd "$RUNNER_TEMP"
+          export XDG_DATA_HOME="$RUNNER_TEMP/greign-user-data"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          demo="$XDG_DATA_HOME/greign/exports/r7-render-fix"
+          mkdir -p "$demo"
+          /usr/bin/python3 -c 'from PIL import Image; import sys; Image.new("RGB",(320,240),"teal").save(sys.argv[1])' "$demo/152A0123-after.jpg"
+          printf '[{"action":"capture","path":"%s/preview.png"}]' "$RUNNER_TEMP" > replay.json
+          timeout 90s xvfb-run -a greign --smoke-script "$RUNNER_TEMP/replay.json"
+          test -s preview.png
+          python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["rolls"][0]["frames"]' "$XDG_DATA_HOME/greign/.greign/rolls.json"
+
+  windows-source:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Make NASM available for the JPEG codec
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "$env:ProgramFiles\NASM" >> $env:GITHUB_PATH
+      - run: cargo build --release --locked -p greign-app
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, linux-install, windows-source]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: Greign-macos-*
+          pattern: Greign-*
           path: dist
           merge-multiple: true
       - name: Publish private release downloads
@@ -74,14 +134,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           cat > /tmp/release-notes.md <<'EOF'
-          Native Greign film workspace for macOS 12 or newer.
+          Greign film workspace beta for x86-64 Ubuntu desktops and Apple Silicon Macs.
 
-          Built for Apple Silicon Macs (M1 or newer). Open the DMG and drag Greign to Applications. No development tools are needed.
+          Linux: download Greign-linux-amd64.deb, install it with `sudo apt install ./Greign-linux-amd64.deb`, then open Greign from the applications menu. Tested on Ubuntu 22.04 and 24.04.
+
+          Windows x64: see docs/windows.md in the tagged source for the MSVC build instructions.
+
+          Mac: built for Apple Silicon Macs (M1 or newer). Open the DMG and drag Greign to Applications. No development tools are needed.
 
           Auto Upright now uses a bundled whole-scene classifier when face-based orientation is uncertain. Both models run locally on the CPU.
 
-          These builds are ad-hoc signed and not notarized. If macOS blocks the first launch, use System Settings → Privacy & Security → Open Anyway after attempting to open the app.
+          Mac builds are ad-hoc signed and not notarized. If macOS blocks the first launch, use System Settings → Privacy & Security → Open Anyway after attempting to open the app.
 
-          Libraries persist under ~/Library/Application Support/Greign; default exports go to ~/Pictures/Greign. Private photographs are not included. This is an initial prototype release; real film color validation remains ongoing.
+          On macOS, libraries persist under ~/Library/Application Support/Greign; default exports go to ~/Pictures/Greign. Private photographs are not included. This is an initial prototype release; real film color validation remains ongoing.
           EOF
-          gh release create "$TAG" dist/*.dmg dist/*.zip --title "Greign $TAG for macOS" --notes-file /tmp/release-notes.md --prerelease
+          gh release create "$TAG" dist/*.dmg dist/*.zip dist/*.deb --title "Greign $TAG" --notes-file /tmp/release-notes.md --prerelease

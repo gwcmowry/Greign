@@ -2,8 +2,8 @@
 Type=Application
 Name=Greign
 Comment=Local film-roll workspace
-Exec=/home/grant/Desktop/programming/Greign/target/release/greign-app
-Path=/home/grant/Desktop/programming/Greign
+Exec=greign
+Icon=greign
 Terminal=false
 Categories=Graphics;Photography;
 StartupNotify=true
